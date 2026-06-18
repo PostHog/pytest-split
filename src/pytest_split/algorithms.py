@@ -1,10 +1,13 @@
 import enum
 import heapq
 from abc import ABC, abstractmethod
+from itertools import pairwise
 from operator import itemgetter
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from _pytest import nodes
 
 
@@ -148,15 +151,205 @@ class DurationBasedChunksAlgorithm(AlgorithmBase):
         ]
 
 
+class OptimalChunksAlgorithm(AlgorithmBase):
+    """
+    Split tests into contiguous groups with provably optimal balance.
+
+    Like ``duration_based_chunks``, this keeps tests in their original collection
+    order and only ever cuts the sequence into non-overlapping, contiguous slices
+    (``group_1 = items[0:i_0]``, ``group_2 = items[i_0:i_1]``, ...). It therefore
+    maintains *absolute order*: it never scatters tests across groups the way
+    ``least_duration`` does. That makes it safe for suites with implicit
+    inter-test ordering (a very common situation with Django's ``TestCase`` /
+    ``TransactionTestCase``, where DB state and auto-increment IDs leak between
+    neighbouring tests).
+
+    The difference from ``duration_based_chunks`` is *where* the cuts go.
+    ``duration_based_chunks`` uses a naive greedy rule (start a new group as soon
+    as the current one reaches ``total / splits``), which front-loads early groups
+    and can leave the slowest group much heavier than necessary. This algorithm
+    instead computes the cut points that minimise the duration of the *slowest*
+    group (the makespan) -- which is exactly what determines CI wall-clock time.
+
+    This is the classic "linear partition" / "split array largest sum" /
+    "painter's partition" problem. The optimum is found by binary-searching the
+    smallest feasible makespan ``C`` (every group sum <= ``C``) and checking
+    feasibility with a greedy left-to-right fill -- ``O(n log(sum))``. The result
+    is reconstructed deterministically, so every CI node computes the same groups.
+
+    :param splits: How many groups we're splitting in.
+    :param items: Test items passed down by Pytest.
+    :param durations: Our cached test runtimes. Assumes contains timings only of relevant tests
+    :return: List of TestGroup
+    """
+
+    SCALE = 1_000_000  # seconds -> microseconds, so we can partition on exact ints
+
+    def __call__(
+        self, splits: int, items: "list[nodes.Item]", durations: "dict[str, float]"
+    ) -> "list[TestGroup]":
+        items_with_durations = _get_items_with_durations(items, durations)
+        weights = [round(d * self.SCALE) for _, d in items_with_durations]
+        boundaries = _optimal_boundaries(weights, splits)
+        return _groups_from_boundaries(items_with_durations, boundaries)
+
+
+def _greedy_boundaries(weights: "list[int]", capacity: int) -> "list[int]":
+    """Left-to-right greedy fill at `capacity`; returns boundary indices [0, ..., n].
+
+    Assumes `capacity >= max(weights)`, so every single item fits in a group.
+    """
+    boundaries = [0]
+    current = 0
+    for i, w in enumerate(weights):
+        if current + w > capacity:
+            boundaries.append(i)
+            current = w
+        else:
+            current += w
+    boundaries.append(len(weights))
+    return boundaries
+
+
+def _feasible_groups(weights: "list[int]", capacity: int) -> int:
+    """Number of contiguous groups a greedy fill needs at `capacity`."""
+    return len(_greedy_boundaries(weights, capacity)) - 1
+
+
+def _best_split_point(weights: "list[int]", start: int, end: int) -> int:
+    """Index in (start, end) that splits the slice into the most balanced halves."""
+    total = sum(weights[start:end])
+    left = 0
+    best_cut = start + 1
+    best_max = float("inf")
+    for i in range(start, end - 1):
+        left += weights[i]
+        worst_half = max(left, total - left)
+        if worst_half < best_max:
+            best_max = worst_half
+            best_cut = i + 1
+    return best_cut
+
+
+def _optimal_boundaries(weights: "list[int]", splits: int) -> "list[int]":
+    """Boundary indices for `splits` contiguous groups minimising the slowest group.
+
+    Returns ``splits + 1`` indices ``[0, b_1, ..., b_{splits-1}, n]``.
+    """
+    n = len(weights)
+    if splits <= 1:
+        return [0, n]
+    if n <= splits:
+        # One test per group as far as they go, then trailing empty groups.
+        return list(range(n + 1)) + [n] * (splits - n)
+
+    # Binary search the smallest makespan that fits in `splits` groups.
+    lo, hi = max(weights), sum(weights)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _feasible_groups(weights, mid) <= splits:
+            hi = mid
+        else:
+            lo = mid + 1
+    capacity = lo
+
+    # Greedy fill at the optimal capacity may use fewer than `splits` groups.
+    # Splitting any group into two contiguous halves keeps every group <= capacity,
+    # so we can always reach exactly `splits` groups without hurting the makespan.
+    boundaries = _greedy_boundaries(weights, capacity)
+    while len(boundaries) - 1 < splits:
+        splittable = [
+            idx
+            for idx in range(len(boundaries) - 1)
+            if boundaries[idx + 1] - boundaries[idx] >= 2  # noqa: PLR2004
+        ]
+        if not splittable:
+            # Every group is a single test already; pad with empty trailing groups.
+            boundaries.append(n)
+            continue
+        # Split the heaviest group; smaller halves stay <= capacity, so the
+        # makespan can't get worse.
+        biggest = max(
+            splittable,
+            key=lambda idx: sum(weights[boundaries[idx] : boundaries[idx + 1]]),
+        )
+        start, end = boundaries[biggest], boundaries[biggest + 1]
+        boundaries.insert(biggest + 1, _best_split_point(weights, start, end))
+    return boundaries
+
+
+def _groups_from_boundaries(
+    items_with_durations: "list[tuple[nodes.Item, float]]", boundaries: "list[int]"
+) -> "list[TestGroup]":
+    """Build one TestGroup per ``[boundaries[i], boundaries[i + 1])`` slice."""
+    items = [item for item, _ in items_with_durations]
+    groups = []
+    for start, end in pairwise(boundaries):
+        groups.append(
+            TestGroup(
+                selected=items[start:end],
+                deselected=items[:start] + items[end:],
+                duration=sum(d for _, d in items_with_durations[start:end]),
+            )
+        )
+    return groups
+
+
+def _path_of(nodeid: str) -> str:
+    """The test file portion of a node id (everything before the first '::')."""
+    return nodeid.split("::", 1)[0]
+
+
+def _dir_of(path: str) -> str:
+    """The directory portion of a test file path ('' for a top-level file)."""
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def _group_average_durations(
+    durations: "dict[str, float]", key_of: "Callable[[str], str]"
+) -> "dict[str, float]":
+    """Average known duration per group, where a group is ``key_of(nodeid)``."""
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for nodeid, dur in durations.items():
+        key = key_of(nodeid)
+        totals[key] = totals.get(key, 0.0) + dur
+        counts[key] = counts.get(key, 0) + 1
+    return {key: total / counts[key] for key, total in totals.items()}
+
+
 def _get_items_with_durations(
     items: "list[nodes.Item]", durations: "dict[str, float]"
 ) -> "list[tuple[nodes.Item, float]]":
     durations = _remove_irrelevant_durations(items, durations)
-    avg_duration_per_test = _get_avg_duration_per_test(durations)
-    items_with_durations = [
-        (item, durations.get(item.nodeid, avg_duration_per_test)) for item in items
+    global_average = _get_avg_duration_per_test(durations)
+    file_average = _group_average_durations(durations, _path_of)
+    dir_average = _group_average_durations(
+        durations, lambda nodeid: _dir_of(_path_of(nodeid))
+    )
+
+    def estimate(nodeid: str) -> float:
+        # A test with no stored timing is most like its file neighbours, then its
+        # directory, then the suite as a whole. Falling back through those levels
+        # beats the global average on skewed suites, where it badly under- or
+        # over-budgets a freshly added test (the common case in a fast-moving repo).
+        path = _path_of(nodeid)
+        if path in file_average:
+            return file_average[path]
+        directory = _dir_of(path)
+        if directory in dir_average:
+            return dir_average[directory]
+        return global_average
+
+    return [
+        (
+            item,
+            durations[item.nodeid]
+            if item.nodeid in durations
+            else estimate(item.nodeid),
+        )
+        for item in items
     ]
-    return items_with_durations
 
 
 def _get_avg_duration_per_test(durations: "dict[str, float]") -> float:
@@ -180,6 +373,7 @@ def _remove_irrelevant_durations(
 class Algorithms(enum.Enum):
     duration_based_chunks = DurationBasedChunksAlgorithm()
     least_duration = LeastDurationAlgorithm()
+    optimal_chunks = OptimalChunksAlgorithm()
 
     @staticmethod
     def names() -> "list[str]":

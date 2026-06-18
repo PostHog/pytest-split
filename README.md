@@ -72,12 +72,14 @@ where the letters (A to E) refer to individual IPython Notebooks, and the number
 
 ## Splitting algorithms
 The plugin supports multiple algorithms to split tests into groups.
-Each algorithm makes different tradeoffs, but generally `least_duration` should give more balanced groups.
+Each algorithm makes different tradeoffs between how balanced the groups are and
+whether the original test order is preserved.
 
 | Algorithm      | Maintains Absolute Order | Maintains Relative Order | Split Quality | Works with random ordering |
 |----------------|--------------------------|--------------------------|---------------|----------------------------|
 | duration_based_chunks | ✅                | ✅                       | Good          | ❌                         |
-| least_duration | ❌                       | ✅                       | Better        | ✅                         |
+| optimal_chunks | ✅                       | ✅                       | Best (order-preserving) | ❌               |
+| least_duration | ❌                       | ✅                       | Best (overall) | ✅                        |
 
 Explanation of the terms in the table:
 
@@ -87,6 +89,24 @@ Explanation of the terms in the table:
 
 The `duration_based_chunks` algorithm aims to find optimal boundaries for the list of tests and every test group contains all tests between the start and end boundary.
 The `least_duration` algorithm walks the list of tests and assigns each test to the group with the smallest current duration.
+
+The `optimal_chunks` algorithm splits the test list into the same kind of
+contiguous, non-overlapping groups as `duration_based_chunks` (so it maintains
+absolute order and never scatters tests across groups), but it computes the cut
+points that **minimise the duration of the slowest group** instead of using a
+greedy rule. Concretely, given test durations `[5, 4, 4]` split into two groups,
+`duration_based_chunks` produces `[5, 4] | [4]` (slowest group = 9), while
+`optimal_chunks` produces `[5] | [4, 4]` (slowest group = 8). This is the classic
+[linear partition / "split array largest sum"](https://leetcode.com/problems/split-array-largest-sum/)
+problem, solved optimally via binary search on the makespan.
+
+Prefer `optimal_chunks` over `least_duration` when your suite has implicit
+ordering between neighbouring tests — a common situation with **Django**, where
+`TestCase` / `TransactionTestCase` leak database state and auto-increment IDs
+between adjacent tests. `least_duration` reorders tests for the sake of a
+marginally better balance and tends to surface those latent dependencies as
+flaky failures; `optimal_chunks` keeps neighbours together while still giving you
+the best possible balance for that order.
 
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)
