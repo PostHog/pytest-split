@@ -434,3 +434,129 @@ class TestHasExpectedOutput:
 
 def _passed_test_names(result):
     return [passed.nodeid.split("::")[-1] for passed in result.listoutcomes()[0]]
+
+
+class TestFileGranularity:
+    def test_partitions_whole_files_across_groups(self, testdir, durations_path):
+        # --rootdir pins the frame so the hand-written durations (keyed to that
+        # root) match the collected paths. pytester otherwise drifts rootdir
+        # between runs; CI always stores and splits from one repo root.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+
+        group_1 = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        group_2 = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "2",
+            "--group",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+
+        # one whole file per group -- each runs exactly its file's tests, in order
+        assert _passed_test_names(group_1) == ["test_a1", "test_a2"]
+        assert _passed_test_names(group_2) == ["test_z1", "test_z2"]
+
+    def test_skips_other_groups_files_before_import(self, testdir, durations_path):
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        testdir.runpytest("--store-durations", "--durations-path", durations_path)
+        # make the second file blow up the moment it is imported (collected)
+        testdir.makepyfile(test_zzz="raise RuntimeError('test_zzz was imported')\n")
+
+        # group 1 owns test_aaa -> test_zzz is pruned before import, so no error
+        owner_of_aaa = testdir.runpytest_subprocess(
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert owner_of_aaa.ret == ExitCode.OK
+        owner_of_aaa.assert_outcomes(passed=2)
+
+        # group 2 owns test_zzz -> it IS imported, so the raise surfaces. This is
+        # the converse that proves the skip above is real, not unconditional.
+        owner_of_zzz = testdir.runpytest_subprocess(
+            "--splits",
+            "2",
+            "--group",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert owner_of_zzz.ret != ExitCode.OK
+        owner_of_zzz.stdout.fnmatch_lines(["*test_zzz was imported*"])
+
+    def test_covers_every_untimed_file_exactly_once(self, testdir, durations_path):
+        testdir.makepyfile(
+            test_aaa="def test_a(): pass\n",
+            test_bbb="def test_b(): pass\n",
+            test_ccc="def test_c(): pass\n",
+        )
+        # no stored durations -> every file is placed by the stable hash fallback
+        with open(durations_path, "w") as f:
+            json.dump({}, f)
+
+        splits = 3
+        ran = []
+        for group in range(1, splits + 1):
+            result = testdir.inline_run(
+                "--splits",
+                str(splits),
+                "--group",
+                str(group),
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            ran.extend(_passed_test_names(result))
+
+        # each file ran on exactly one group -- full coverage, no duplication
+        assert sorted(ran) == ["test_a", "test_b", "test_c"]
+
+    def test_file_granularity_requires_modern_pytest(self, testdir, monkeypatch):
+        # The pre-import hook (collection_path) is pytest>=7; older pytest would
+        # silently drop it, so the option must fail loudly there instead.
+        monkeypatch.setattr(pytest, "__version__", "6.2.5")
+        testdir.makepyfile(test_x="def test_1(): pass\n")
+        result = testdir.runpytest(
+            "--splits", "2", "--group", "1", "--split-granularity", "file"
+        )
+        assert result.ret == ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(["*requires pytest>=7*"])

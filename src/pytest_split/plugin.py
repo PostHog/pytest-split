@@ -1,3 +1,4 @@
+import fnmatch
 import json
 import os
 from typing import TYPE_CHECKING
@@ -10,6 +11,8 @@ from pytest_split import algorithms
 from pytest_split.ipynb_compatibility import ensure_ipynb_compatibility
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from _pytest import nodes
     from _pytest.config import Config
     from _pytest.config.argparsing import Parser
@@ -18,6 +21,10 @@ if TYPE_CHECKING:
 
 # Ugly hack for freezegun compatibility: https://github.com/spulec/freezegun/issues/286
 STORE_DURATIONS_SETUP_AND_TEARDOWN_THRESHOLD = 60 * 10  # seconds
+
+# `--split-granularity=file` relies on the `collection_path` ignore-collect hook,
+# which pytest added in 7.0.
+MIN_PYTEST_FOR_FILE_GRANULARITY = 7
 
 
 def pytest_addoption(parser: "Parser") -> None:
@@ -64,6 +71,20 @@ def pytest_addoption(parser: "Parser") -> None:
         choices=algorithms.Algorithms.names(),
     )
     group.addoption(
+        "--split-granularity",
+        dest="split_granularity",
+        type=str,
+        help=(
+            "What to split on. 'item' (default) splits individual tests after the "
+            "whole suite is collected. 'file' assigns whole test files to groups and "
+            "skips other groups' files before they are imported -- this avoids "
+            "collecting (importing) the entire tree on every shard, which is the "
+            "dominant per-shard cost on a large suite."
+        ),
+        default="item",
+        choices=("item", "file"),
+    )
+    group.addoption(
         "--clean-durations",
         dest="clean_durations",
         action="store_true",
@@ -97,6 +118,19 @@ def pytest_cmdline_main(config: "Config") -> "int | ExitCode | None":
     if group < 1 or group > splits:
         raise pytest.UsageError(f"argument `--group` must be >= 1 and <= {splits}")
 
+    pytest_major = int(pytest.__version__.split(".", 1)[0])
+    if (
+        config.option.split_granularity == "file"
+        and pytest_major < MIN_PYTEST_FOR_FILE_GRANULARITY
+    ):
+        # File granularity prunes via the `collection_path` ignore-collect hook,
+        # added in pytest 7. On older pytest the hook would be silently dropped
+        # (every shard would then run every file), so fail loudly instead.
+        raise pytest.UsageError(
+            "`--split-granularity=file` requires pytest>=7; "
+            "use the default `--split-granularity=item` on older pytest"
+        )
+
     return None
 
 
@@ -105,7 +139,14 @@ def pytest_configure(config: "Config") -> None:
     Enable the plugins we need.
     """
     if config.option.splits and config.option.group:
-        config.pluginmanager.register(PytestSplitPlugin(config), "pytestsplitplugin")
+        if config.option.split_granularity == "file":
+            config.pluginmanager.register(
+                PytestSplitFilePlugin(config), "pytestsplitfileplugin"
+            )
+        else:
+            config.pluginmanager.register(
+                PytestSplitPlugin(config), "pytestsplitplugin"
+            )
 
     if config.option.store_durations:
         config.pluginmanager.register(
@@ -178,6 +219,83 @@ class PytestSplitPlugin(Base):
                 f"[pytest-split] Running group {group_idx}/{splits} (estimated duration: {group.duration:.2f}s)\n"
             )
         )
+
+
+class PytestSplitFilePlugin(Base):
+    """
+    File-granularity splitting.
+
+    Assigns whole test files to groups and tells pytest to skip the other groups'
+    files via ``pytest_ignore_collect`` -- which runs *before* a file is imported.
+    The item-level plugin deselects in ``pytest_collection_modifyitems``, which
+    only runs once the whole tree has been collected (imported); on a large suite
+    that whole-tree import is the dominant per-shard cost. Skipping unowned files
+    up front avoids it.
+
+    Whole files are never split, so within-file test order is always preserved --
+    which is what order-dependent (e.g. Django) suites need. Files with a stored
+    duration are balanced by the makespan partition; files without one (new tests)
+    are placed deterministically so each still runs on exactly one shard.
+    """
+
+    def __init__(self, config: "Config") -> None:
+        super().__init__(config)
+        self.splits: int = config.option.splits
+        self.group_idx: int = config.option.group - 1  # 0-based
+        # nodeids are relative to rootpath. resolve() so the symlinked-tmp case
+        # (macOS /tmp -> /private/tmp) doesn't break the relative_to below.
+        self.rootpath = config.rootpath.resolve()
+        self.test_file_patterns: list[str] = config.getini("python_files")
+        self.assignment = algorithms.file_group_assignment(
+            self.cached_durations, self.splits
+        )
+
+    def _is_test_file(self, name: str) -> bool:
+        return any(
+            fnmatch.fnmatch(name, pattern) for pattern in self.test_file_patterns
+        )
+
+    def _group_of(self, rel_path: str) -> int:
+        if rel_path in self.assignment:
+            return self.assignment[rel_path]
+        # New file with no stored timing: place it deterministically.
+        return algorithms.stable_group(rel_path, self.splits)
+
+    def pytest_ignore_collect(self, collection_path: "Path") -> "bool | None":
+        # `collection_path` (pytest >=7) is the pre-import gate -- pytest calls it
+        # before importing a file. Splitting here, rather than deselecting in
+        # pytest_collection_modifyitems (post-import), is what avoids collecting
+        # the whole tree on every shard.
+        #
+        # Only decide for test files. Returning None for directories lets pytest
+        # recurse into them; returning None for non-test files (conftest.py,
+        # helpers) leaves them untouched.
+        if not self._is_test_file(collection_path.name):
+            return None
+        try:
+            rel_path = collection_path.relative_to(self.rootpath).as_posix()
+        except ValueError:  # pragma: no cover
+            # Fast path failed: rootpath/collection_path can disagree on symlinks.
+            # Resolve the file (only on the slow path) and retry before giving up.
+            # Defensive -- the fast path holds whenever the checkout isn't behind
+            # a symlink, which is the norm in CI.
+            try:
+                rel_path = (
+                    collection_path.resolve().relative_to(self.rootpath).as_posix()
+                )
+            except ValueError:
+                return None  # genuinely outside rootdir -- don't second-guess pytest
+        if self._group_of(rel_path) != self.group_idx:
+            return True  # not our file: skip it before it is imported
+        return None  # our file: collect as usual (honouring any other --ignore)
+
+    def pytest_report_collectionfinish(self) -> "list[str]":
+        return [
+            self.writer.markup(
+                f"[pytest-split] Splitting by file, running group "
+                f"{self.group_idx + 1}/{self.splits}"
+            )
+        ]
 
 
 class PytestSplitCachePlugin(Base):

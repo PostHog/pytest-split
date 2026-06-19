@@ -1,4 +1,5 @@
 import enum
+import hashlib
 import heapq
 from abc import ABC, abstractmethod
 from itertools import pairwise
@@ -368,6 +369,53 @@ def _remove_irrelevant_durations(
     test_ids = [item.nodeid for item in items]
     durations = {name: durations[name] for name in test_ids if name in durations}
     return durations
+
+
+def file_group_assignment(
+    durations: "dict[str, float]", splits: int
+) -> "dict[str, int]":
+    """Assign each timed test *file* to one of ``splits`` groups (0-based).
+
+    Files are weighted by the summed duration of their known tests and cut into
+    ``splits`` contiguous, order-preserving slices that minimise the slowest
+    group -- the same makespan partition ``optimal_chunks`` uses, but whole files
+    are never split. This is what makes file-granularity splitting order-safe:
+    intra-file order is always preserved, so the within-file ordering that Django
+    suites rely on can't be broken by the split.
+
+    Only files that appear in ``durations`` are assigned here. A file with no
+    stored timing isn't known until pytest walks the tree, so the caller places
+    those at collection time via :func:`stable_group`.
+    """
+    weights_by_file: dict[str, float] = {}
+    for nodeid, dur in durations.items():
+        path = _path_of(nodeid)
+        weights_by_file[path] = weights_by_file.get(path, 0.0) + dur
+
+    files = sorted(weights_by_file)
+    weights = [
+        round(weights_by_file[path] * OptimalChunksAlgorithm.SCALE) for path in files
+    ]
+    boundaries = _optimal_boundaries(weights, splits)
+
+    assignment: dict[str, int] = {}
+    for group_idx, (start, end) in enumerate(pairwise(boundaries)):
+        for path in files[start:end]:
+            assignment[path] = group_idx
+    return assignment
+
+
+def stable_group(path: str, splits: int) -> int:
+    """Deterministically map an (untimed) file path to a group, 0-based.
+
+    Used for files with no stored duration -- new tests, which a fast-moving repo
+    adds daily. A content hash, not the built-in ``hash()``: every CI shard runs
+    in its own process with a randomised hash seed, so ``hash()`` would send the
+    same new file to a different group on each shard and the file would be run
+    on several shards or none. blake2b is identical across processes.
+    """
+    digest = hashlib.blake2b(path.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % splits
 
 
 class Algorithms(enum.Enum):

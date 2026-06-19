@@ -1,3 +1,4 @@
+import hashlib
 import itertools
 from collections import namedtuple
 from typing import TYPE_CHECKING
@@ -11,6 +12,8 @@ from pytest_split.algorithms import (
     AlgorithmBase,
     Algorithms,
     _get_items_with_durations,
+    file_group_assignment,
+    stable_group,
 )
 
 item = namedtuple("item", "nodeid")  # noqa: PYI024
@@ -277,3 +280,71 @@ class TestAbstractAlgorithm:
         algo = MyAlgorithm()
         other = "not an algorithm"
         assert algo.__eq__(other) is NotImplemented
+
+
+class TestFileGroupAssignment:
+    def test_assigns_each_timed_file_to_exactly_one_group(self):
+        splits = 2
+        durations = {
+            "a/test_1.py::test_x": 1.0,
+            "a/test_1.py::test_y": 1.0,
+            "b/test_2.py::test_x": 2.0,
+            "c/test_3.py::test_x": 2.0,
+        }
+        assignment = file_group_assignment(durations, splits)
+
+        assert set(assignment) == {"a/test_1.py", "b/test_2.py", "c/test_3.py"}
+        assert all(0 <= group < splits for group in assignment.values())
+
+    def test_balances_file_weights_into_contiguous_groups(self):
+        # Files sorted: test_1 (heavy), test_2 (light), test_3 (light).
+        # The makespan-optimal cut into 2 groups isolates the heavy file.
+        durations = {
+            "test_1.py::a": 10.0,
+            "test_2.py::a": 1.0,
+            "test_3.py::a": 1.0,
+        }
+        assignment = file_group_assignment(durations, splits=2)
+
+        assert assignment["test_1.py"] == 0
+        assert assignment["test_2.py"] == 1
+        assert assignment["test_3.py"] == 1
+
+    def test_sums_durations_per_file(self):
+        # One file with many small tests outweighs another with a single big test.
+        durations = {
+            "test_1.py::a": 1.0,
+            "test_1.py::b": 1.0,
+            "test_1.py::c": 1.0,
+            "test_2.py::a": 2.0,
+        }
+        assignment = file_group_assignment(durations, splits=2)
+
+        # test_1 (sum 3.0) and test_2 (2.0) each land in their own group.
+        assert assignment["test_1.py"] != assignment["test_2.py"]
+
+
+class TestStableGroup:
+    def test_is_deterministic(self):
+        assert stable_group("posthog/test_foo.py", 7) == stable_group(
+            "posthog/test_foo.py", 7
+        )
+
+    def test_stays_within_range(self):
+        splits = 8
+        for i in range(50):
+            group = stable_group(f"pkg/test_{i}.py", splits)
+            assert 0 <= group < splits
+
+    def test_does_not_depend_on_pythonhashseed(self):
+        # blake2b, not the salted built-in hash() -- so the value is fixed and
+        # every CI shard process maps a new file to the same group.
+        splits = 16
+        path = "products/new/test_thing.py"
+        expected = (
+            int.from_bytes(
+                hashlib.blake2b(path.encode(), digest_size=8).digest(), "big"
+            )
+            % splits
+        )
+        assert stable_group(path, splits) == expected

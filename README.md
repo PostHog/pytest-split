@@ -108,6 +108,32 @@ marginally better balance and tends to surface those latent dependencies as
 flaky failures; `optimal_chunks` keeps neighbours together while still giving you
 the best possible balance for that order.
 
+## Splitting granularity
+
+By default `pytest-split` splits at the level of individual test *items*: pytest
+collects (imports) the whole test tree, then the plugin deselects the items that
+don't belong to the current group. On a large suite that whole-tree import is the
+dominant per-shard cost — every shard imports everything just to run its slice.
+
+`--split-granularity=file` (default `item`) assigns whole test *files* to groups
+instead, and skips the other groups' files via `pytest_ignore_collect`, **before
+they are imported**. A shard then only imports the files it actually runs, which
+removes the duplicated collection cost. The file weights still feed the same
+makespan partition as `optimal_chunks`, so the groups stay balanced; whole files
+are never split, so within-file ordering is always preserved.
+
+```sh
+pytest --splits 3 --group 1 --split-granularity file --splitting-algorithm optimal_chunks
+```
+
+Notes:
+* Requires pytest >= 7 (it uses the `collection_path` ignore-collect hook).
+* Files with no stored timing (newly added tests) are placed deterministically,
+  so each runs on exactly one shard — coverage is never dropped or duplicated.
+* A single file heavier than one shard's budget can't be split further, so very
+  unbalanced individual files can cap how even the groups get; `--store-durations`
+  keeps the weights honest.
+
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)
 
