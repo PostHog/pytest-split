@@ -560,3 +560,99 @@ class TestFileGranularity:
         )
         assert result.ret == ExitCode.USAGE_ERROR
         result.stderr.fnmatch_lines(["*requires pytest>=7*"])
+
+    def test_oversized_file_is_split_across_its_bucket(self, testdir, durations_path):
+        # A file far heavier than one shard widens its bucket; stage 2 then splits
+        # that file's items across the bucket's shards -- so both shards collect it
+        # (the overlap) and each runs part of it. Neither shard is left empty.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_heavy="".join(f"def test_h{i}(): pass\n" for i in range(6)),
+            test_light="def test_l1(): pass\ndef test_l2(): pass\n",
+        )
+        durations = {f"test_heavy.py::test_h{i}": 10.0 for i in range(6)}
+        durations.update({"test_light.py::test_l1": 1.0, "test_light.py::test_l2": 1.0})
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+
+        runs = [
+            testdir.inline_run(
+                *rootdir,
+                "--splits",
+                "2",
+                "--group",
+                str(g),
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            for g in (1, 2)
+        ]
+        per_shard = [_passed_test_names(r) for r in runs]
+
+        # full coverage, each test exactly once
+        assert sorted(per_shard[0] + per_shard[1]) == sorted(
+            [f"test_h{i}" for i in range(6)] + ["test_l1", "test_l2"]
+        )
+        # the heavy file was actually split: both shards ran something
+        assert per_shard[0]
+        assert per_shard[1]
+
+    def test_partition_ignores_stale_durations(self, testdir, durations_path):
+        # A heavy stored timing for a file that no longer exists must not warp the
+        # partition (or send a shard chasing a file that isn't there).
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(test_real="def test_r1(): pass\ndef test_r2(): pass\n")
+        durations = {
+            "test_real.py::test_r1": 1.0,
+            "test_real.py::test_r2": 1.0,
+            "test_deleted.py::test_x": 9999.0,  # stale: not on disk
+        }
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+
+        result = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "1",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert sorted(_passed_test_names(result)) == ["test_r1", "test_r2"]
+
+    def test_partition_excludes_ignored_files(self, testdir, durations_path):
+        # An --ignore-d file is out of this run's scope, so it must not get weight
+        # in the partition (nor be collected). A huge stored timing for it would
+        # otherwise warp the buckets.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_kept="def test_k1(): pass\ndef test_k2(): pass\n",
+            test_skipped="def test_s1(): pass\n",
+        )
+        durations = {
+            "test_kept.py::test_k1": 1.0,
+            "test_kept.py::test_k2": 1.0,
+            "test_skipped.py::test_s1": 9999.0,
+        }
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+
+        result = testdir.inline_run(
+            *rootdir,
+            "--ignore",
+            "test_skipped.py",
+            "--splits",
+            "1",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert sorted(_passed_test_names(result)) == ["test_k1", "test_k2"]

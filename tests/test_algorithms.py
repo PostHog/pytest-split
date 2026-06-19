@@ -12,6 +12,7 @@ from pytest_split.algorithms import (
     AlgorithmBase,
     Algorithms,
     _get_items_with_durations,
+    bucket_plan,
     file_group_assignment,
     stable_group,
 )
@@ -348,3 +349,46 @@ class TestStableGroup:
             % splits
         )
         assert stable_group(path, splits) == expected
+
+
+class TestBucketPlan:
+    def test_one_bucket_per_shard_when_no_file_exceeds_cap(self):
+        # Even-weight files, none over total/splits -> width 1, buckets == splits.
+        splits = 4
+        durations = {f"f{i}/test.py::t": 1.0 for i in range(8)}
+        plan = bucket_plan(durations, splits)
+        assert plan.num_buckets == splits
+        assert plan.bucket_widths == [1] * splits
+        assert plan.shard_bucket == list(range(splits))
+
+    def test_widens_buckets_to_absorb_an_oversized_file(self):
+        # One file far heavier than the cap forces wider buckets so stage 2 can
+        # split it across the bucket's shards.
+        splits = 8
+        durations = {"big/test.py::t": 100.0}
+        durations.update({f"f{i}/test.py::t": 1.0 for i in range(20)})
+        plan = bucket_plan(durations, splits)
+        assert plan.num_buckets < splits  # widened
+        assert max(plan.bucket_widths) > 1  # at least one multi-shard bucket
+        assert sum(plan.bucket_widths) == splits  # still exactly `splits` shards
+
+    def test_shard_maps_cover_every_shard_exactly_once(self):
+        durations = {f"f{i}/test.py::t": float(i % 5 + 1) for i in range(40)}
+        splits = 7
+        plan = bucket_plan(durations, splits)
+        assert len(plan.shard_bucket) == splits
+        assert len(plan.shard_within) == splits
+        assert sum(plan.bucket_widths) == splits
+        # within-index runs 0..width-1 inside each bucket
+        seen: dict[int, list[int]] = {}
+        for bucket, within in zip(plan.shard_bucket, plan.shard_within, strict=True):
+            seen.setdefault(bucket, []).append(within)
+        for bucket, withins in seen.items():
+            assert sorted(withins) == list(range(plan.bucket_widths[bucket]))
+
+    def test_no_durations_falls_back_to_one_file_bucket_per_shard(self):
+        splits = 3
+        plan = bucket_plan({}, splits)
+        assert plan.num_buckets == splits
+        assert plan.bucket_widths == [1] * splits
+        assert plan.file_bucket == {}  # everything placed by hash at collection time

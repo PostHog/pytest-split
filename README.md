@@ -115,12 +115,24 @@ collects (imports) the whole test tree, then the plugin deselects the items that
 don't belong to the current group. On a large suite that whole-tree import is the
 dominant per-shard cost — every shard imports everything just to run its slice.
 
-`--split-granularity=file` (default `item`) assigns whole test *files* to groups
-instead, and skips the other groups' files via `pytest_ignore_collect`, **before
-they are imported**. A shard then only imports the files it actually runs, which
-removes the duplicated collection cost. The file weights still feed the same
-makespan partition as `optimal_chunks`, so the groups stay balanced; whole files
-are never split, so within-file ordering is always preserved.
+`--split-granularity=file` (default `item`) splits in two stages so a shard only
+imports the files it actually runs:
+
+1. **Stage 1 — bucket files (pre-import).** Whole files are grouped into *buckets*,
+   and each shard skips every bucket's files but its own via `pytest_ignore_collect`,
+   **before they are imported**. That's the collection saving. Bucket width is
+   chosen automatically as `ceil(heaviest_file / ideal_shard)` — just wide enough
+   for stage 2 to handle the heaviest single file.
+2. **Stage 2 — split within the bucket (post-import).** Several shards can share a
+   bucket; within it they run the configured item-level algorithm
+   (e.g. `optimal_chunks`) over the bucket's collected items and each keeps its
+   slice. This recovers fine balance and splits a too-heavy file across the
+   bucket's shards, while staying contiguous — so it's as order-safe as the
+   item-level algorithm it reuses.
+
+Wider buckets trade collection saving for balance: at one bucket per shard it's
+pure file-mode (max saving, coarsest); at one bucket total it's plain item-mode.
+The auto width lands in between, scoped per segment.
 
 ```sh
 pytest --splits 3 --group 1 --split-granularity file --splitting-algorithm optimal_chunks
@@ -128,11 +140,11 @@ pytest --splits 3 --group 1 --split-granularity file --splitting-algorithm optim
 
 Notes:
 * Requires pytest >= 7 (it uses the `collection_path` ignore-collect hook).
-* Files with no stored timing (newly added tests) are placed deterministically,
-  so each runs on exactly one shard — coverage is never dropped or duplicated.
-* A single file heavier than one shard's budget can't be split further, so very
-  unbalanced individual files can cap how even the groups get; `--store-durations`
-  keeps the weights honest.
+* The durations universe is scoped to what the run collects — its target paths,
+  minus `--ignore`, minus files no longer on disk — so a multi-segment CI doesn't
+  pollute one segment's partition with another's files or stale keys.
+* Files with no stored timing (new tests) are placed deterministically, so each
+  runs on exactly one shard — coverage is never dropped or duplicated.
 
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)

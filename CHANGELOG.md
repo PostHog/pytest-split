@@ -5,14 +5,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 ### Added
-- New `--split-granularity` option (`item` default, or `file`). `file` assigns
-  whole test files to groups and skips other groups' files via
-  `pytest_ignore_collect` — before they are imported — so a shard no longer
-  collects (imports) the entire test tree just to run its slice. On large suites
-  that whole-tree import is the dominant per-shard cost. File weights feed the
-  same makespan partition, so balance is preserved; whole files are never split,
-  so within-file ordering is kept. Untimed files are placed deterministically
-  (each runs on exactly one shard). Requires pytest >= 7.
+- New `--split-granularity` option (`item` default, or `file`). `file` splits in
+  two stages so a shard imports only the files it runs: stage 1 buckets whole
+  files and skips other buckets via `pytest_ignore_collect` (before import — the
+  collection saving); stage 2 splits each bucket's collected items across its
+  shards with the configured item-level algorithm (recovering fine balance and
+  splitting any too-heavy file), staying contiguous and so as order-safe as the
+  item-level split it reuses. Bucket width auto-tunes to the heaviest file. The
+  durations universe is scoped to the run's targets (minus `--ignore`, minus
+  files no longer on disk), so a multi-segment CI doesn't cross-pollute or carry
+  stale keys. Untimed files are placed deterministically. Requires pytest >= 7.
 - New `optimal_chunks` splitting algorithm. Like `duration_based_chunks` it keeps
   tests in contiguous, in-order groups (so it never scatters tests the way
   `least_duration` does), but it computes the cut points that minimise the

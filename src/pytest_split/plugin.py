@@ -1,6 +1,7 @@
 import fnmatch
 import json
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -11,8 +12,6 @@ from pytest_split import algorithms
 from pytest_split.ipynb_compatibility import ensure_ipynb_compatibility
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from _pytest import nodes
     from _pytest.config import Config
     from _pytest.config.argparsing import Parser
@@ -221,21 +220,36 @@ class PytestSplitPlugin(Base):
         )
 
 
+def _under_any(path: str, prefixes: "list[str]") -> bool:
+    """True if ``path`` is one of, or under, any of ``prefixes`` (a rootdir
+    prefix of ``""``/``"."`` matches everything)."""
+    for prefix in prefixes:
+        if prefix in ("", "."):
+            return True
+        if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+            return True
+    return False
+
+
 class PytestSplitFilePlugin(Base):
     """
-    File-granularity splitting.
+    File-granularity splitting, in two stages.
 
-    Assigns whole test files to groups and tells pytest to skip the other groups'
-    files via ``pytest_ignore_collect`` -- which runs *before* a file is imported.
-    The item-level plugin deselects in ``pytest_collection_modifyitems``, which
-    only runs once the whole tree has been collected (imported); on a large suite
-    that whole-tree import is the dominant per-shard cost. Skipping unowned files
-    up front avoids it.
+    Stage 1 -- ``pytest_ignore_collect`` (pre-import): whole files are grouped into
+    buckets, and a shard skips every bucket's files but its own. Pruning here,
+    before pytest imports a file, is what avoids collecting the whole tree on every
+    shard -- the dominant per-shard cost on a large suite.
 
-    Whole files are never split, so within-file test order is always preserved --
-    which is what order-dependent (e.g. Django) suites need. Files with a stored
-    duration are balanced by the makespan partition; files without one (new tests)
-    are placed deterministically so each still runs on exactly one shard.
+    Stage 2 -- ``pytest_collection_modifyitems`` (post-import): within its bucket, a
+    shard runs the normal item-level algorithm over the bucket's collected items
+    and keeps only its slice. This recovers fine balance and splits any single file
+    too heavy for one shard, while staying contiguous -- so it's as order-safe as
+    the item-level algorithm it reuses.
+
+    The durations universe is scoped to what this run actually collects (its target
+    paths, minus ``--ignore``, minus files no longer on disk), so a multi-segment CI
+    can't pollute one segment's partition with another segment's files or with stale
+    keys for deleted tests.
     """
 
     def __init__(self, config: "Config") -> None:
@@ -246,29 +260,61 @@ class PytestSplitFilePlugin(Base):
         # (macOS /tmp -> /private/tmp) doesn't break the relative_to below.
         self.rootpath = config.rootpath.resolve()
         self.test_file_patterns: list[str] = config.getini("python_files")
-        self.assignment = algorithms.file_group_assignment(
-            self.cached_durations, self.splits
-        )
+        self.plan = algorithms.bucket_plan(self._scoped_durations(config), self.splits)
+        self.my_bucket = self.plan.shard_bucket[self.group_idx]
+        self.my_within = self.plan.shard_within[self.group_idx]
+        self.my_bucket_width = self.plan.bucket_widths[self.my_bucket]
+
+    def _as_rel(self, target: str) -> str:
+        """A pytest target (path arg or --ignore) as a rootdir-relative posix str."""
+        path = Path(target)
+        if not path.is_absolute():
+            path = self.rootpath / path
+        try:
+            return path.resolve().relative_to(self.rootpath).as_posix()
+        except ValueError:
+            return Path(target).as_posix().rstrip("/")
+
+    def _scoped_durations(self, config: "Config") -> "dict[str, float]":
+        """Durations restricted to files this run collects: under a target path,
+        not ``--ignore``-d, and still present on disk (drops stale keys)."""
+        targets = [self._as_rel(a) for a in (config.args or [])]
+        ignores = [self._as_rel(i) for i in (config.getoption("ignore") or [])]
+        ignore_globs = config.getoption("ignore_glob") or []
+        exists: dict[str, bool] = {}
+        scoped: dict[str, float] = {}
+        for nodeid, dur in self.cached_durations.items():
+            path = algorithms._path_of(nodeid)  # noqa: SLF001  (same-package helper)
+            if targets and not _under_any(path, targets):
+                continue
+            if _under_any(path, ignores):
+                continue
+            if any(fnmatch.fnmatch(path, glob) for glob in ignore_globs):
+                continue
+            present = exists.get(path)
+            if present is None:
+                present = (self.rootpath / path).exists()
+                exists[path] = present
+            if not present:
+                continue
+            scoped[nodeid] = dur
+        return scoped
 
     def _is_test_file(self, name: str) -> bool:
         return any(
             fnmatch.fnmatch(name, pattern) for pattern in self.test_file_patterns
         )
 
-    def _group_of(self, rel_path: str) -> int:
-        if rel_path in self.assignment:
-            return self.assignment[rel_path]
-        # New file with no stored timing: place it deterministically.
-        return algorithms.stable_group(rel_path, self.splits)
+    def _bucket_of(self, rel_path: str) -> int:
+        bucket = self.plan.file_bucket.get(rel_path)
+        if bucket is None:
+            # New file with no stored timing: place it in a bucket deterministically.
+            bucket = algorithms.stable_group(rel_path, self.plan.num_buckets)
+        return bucket
 
     def pytest_ignore_collect(self, collection_path: "Path") -> "bool | None":
-        # `collection_path` (pytest >=7) is the pre-import gate -- pytest calls it
-        # before importing a file. Splitting here, rather than deselecting in
-        # pytest_collection_modifyitems (post-import), is what avoids collecting
-        # the whole tree on every shard.
-        #
-        # Only decide for test files. Returning None for directories lets pytest
-        # recurse into them; returning None for non-test files (conftest.py,
+        # Stage 1, the pre-import gate. Only decide for test files; returning None
+        # for directories lets pytest recurse, and for non-test files (conftest.py,
         # helpers) leaves them untouched.
         if not self._is_test_file(collection_path.name):
             return None
@@ -276,23 +322,37 @@ class PytestSplitFilePlugin(Base):
             rel_path = collection_path.relative_to(self.rootpath).as_posix()
         except ValueError:  # pragma: no cover
             # Fast path failed: rootpath/collection_path can disagree on symlinks.
-            # Resolve the file (only on the slow path) and retry before giving up.
-            # Defensive -- the fast path holds whenever the checkout isn't behind
-            # a symlink, which is the norm in CI.
+            # Resolve the file (slow path only) and retry before giving up.
             try:
                 rel_path = (
                     collection_path.resolve().relative_to(self.rootpath).as_posix()
                 )
             except ValueError:
                 return None  # genuinely outside rootdir -- don't second-guess pytest
-        if self._group_of(rel_path) != self.group_idx:
-            return True  # not our file: skip it before it is imported
-        return None  # our file: collect as usual (honouring any other --ignore)
+        if self._bucket_of(rel_path) != self.my_bucket:
+            return True  # another bucket's file: skip it before it is imported
+        return None  # our bucket: collect, then stage 2 splits it among our shards
+
+    @hookimpl(trylast=True)
+    def pytest_collection_modifyitems(
+        self, config: "Config", items: "list[nodes.Item]"
+    ) -> None:
+        # Stage 2: split this bucket's collected items across the shards assigned to
+        # the bucket, with the configured item-level algorithm, and keep our slice.
+        # A bucket that owns a single shard needs no further split.
+        if self.my_bucket_width <= 1:
+            return
+        algo = algorithms.Algorithms[config.option.splitting_algorithm].value
+        group = algo(self.my_bucket_width, items, self.cached_durations)[self.my_within]
+        ensure_ipynb_compatibility(group, items)
+        items[:] = group.selected
+        config.hook.pytest_deselected(items=group.deselected)
 
     def pytest_report_collectionfinish(self) -> "list[str]":
         return [
             self.writer.markup(
-                f"[pytest-split] Splitting by file, running group "
+                f"[pytest-split] Splitting by file: bucket "
+                f"{self.my_bucket + 1}/{self.plan.num_buckets}, group "
                 f"{self.group_idx + 1}/{self.splits}"
             )
         ]
