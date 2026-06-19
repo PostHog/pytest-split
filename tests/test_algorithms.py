@@ -12,8 +12,9 @@ from pytest_split.algorithms import (
     AlgorithmBase,
     Algorithms,
     _get_items_with_durations,
-    bucket_plan,
-    file_group_assignment,
+    _path_of,
+    assign_file_items,
+    item_plan,
     stable_group,
 )
 
@@ -283,48 +284,6 @@ class TestAbstractAlgorithm:
         assert algo.__eq__(other) is NotImplemented
 
 
-class TestFileGroupAssignment:
-    def test_assigns_each_timed_file_to_exactly_one_group(self):
-        splits = 2
-        durations = {
-            "a/test_1.py::test_x": 1.0,
-            "a/test_1.py::test_y": 1.0,
-            "b/test_2.py::test_x": 2.0,
-            "c/test_3.py::test_x": 2.0,
-        }
-        assignment = file_group_assignment(durations, splits)
-
-        assert set(assignment) == {"a/test_1.py", "b/test_2.py", "c/test_3.py"}
-        assert all(0 <= group < splits for group in assignment.values())
-
-    def test_balances_file_weights_into_contiguous_groups(self):
-        # Files sorted: test_1 (heavy), test_2 (light), test_3 (light).
-        # The makespan-optimal cut into 2 groups isolates the heavy file.
-        durations = {
-            "test_1.py::a": 10.0,
-            "test_2.py::a": 1.0,
-            "test_3.py::a": 1.0,
-        }
-        assignment = file_group_assignment(durations, splits=2)
-
-        assert assignment["test_1.py"] == 0
-        assert assignment["test_2.py"] == 1
-        assert assignment["test_3.py"] == 1
-
-    def test_sums_durations_per_file(self):
-        # One file with many small tests outweighs another with a single big test.
-        durations = {
-            "test_1.py::a": 1.0,
-            "test_1.py::b": 1.0,
-            "test_1.py::c": 1.0,
-            "test_2.py::a": 2.0,
-        }
-        assignment = file_group_assignment(durations, splits=2)
-
-        # test_1 (sum 3.0) and test_2 (2.0) each land in their own group.
-        assert assignment["test_1.py"] != assignment["test_2.py"]
-
-
 class TestStableGroup:
     def test_is_deterministic(self):
         assert stable_group("posthog/test_foo.py", 7) == stable_group(
@@ -351,44 +310,83 @@ class TestStableGroup:
         assert stable_group(path, splits) == expected
 
 
-class TestBucketPlan:
-    def test_one_bucket_per_shard_when_no_file_exceeds_cap(self):
-        # Even-weight files, none over total/splits -> width 1, buckets == splits.
+def _tile(plan, durations, items_in_order):
+    """Replay the plugin's modifyitems tiling (via the shared cut rule) and return
+    {nodeid: shard}, grouping by file in the given collection order."""
+    by_file: dict[str, list[str]] = {}
+    for nodeid in items_in_order:
+        by_file.setdefault(_path_of(nodeid), []).append(nodeid)
+    assignment: dict[str, int] = {}
+    for path, nodeids in by_file.items():
+        if path not in plan.file_offset:  # untimed file -> its hash owner
+            for nodeid in nodeids:
+                assignment[nodeid] = stable_group(path, plan.num_shards)
+            continue
+        shards = assign_file_items(plan, durations, path, nodeids)
+        assignment.update(zip(nodeids, shards, strict=True))
+    return assignment
+
+
+class TestItemPlan:
+    def test_most_files_go_to_a_single_shard(self):
+        # Even-weight files spread across shards: each file's items land on one
+        # shard, so its footprint has length 1 (only boundary files have 2).
+        durations = {f"f{i:02d}/test.py::t": 1.0 for i in range(40)}
+        plan = item_plan(durations, splits=4)
+        singletons = sum(1 for s in plan.file_shards.values() if len(s) == 1)
+        assert singletons >= len(plan.file_shards) - 4  # at most ~splits boundary files
+
+    def test_oversized_file_spans_multiple_shards(self):
+        # A file heavier than one shard's budget must be touched by several shards
+        # (its items get split across them).
+        durations = {f"big/test.py::t{i}": 1.0 for i in range(100)}
+        durations.update({f"f{i}/test.py::t": 1.0 for i in range(10)})
+        plan = item_plan(durations, splits=8)
+        assert len(plan.file_shards["big/test.py"]) > 1
+
+    def test_tiling_covers_every_item_within_footprint(self):
+        # The core invariant: every item is assigned to exactly one shard, and to
+        # a shard that collects its file -- regardless of collection order.
+        durations = {
+            f"pkg{i % 7}/test_{i % 3}.py::test_{i}": float(i % 5 + 1)
+            for i in range(120)
+        }
+        splits = 5
+        plan = item_plan(durations, splits)
+        for reverse in (False, True):  # order-independence of the invariants
+            order = sorted(durations, reverse=reverse)
+            assignment = _tile(plan, durations, order)
+            assert set(assignment) == set(durations)  # coverage, no dup
+            for nodeid, shard in assignment.items():
+                path = nodeid.split("::", 1)[0]
+                assert shard in plan.file_shards[path]  # footprint consistency
+            assert {assignment[n] for n in durations} == set(range(splits))
+
+    def test_assign_clamps_untimed_items_into_the_footprint(self):
+        # A timed file's footprint is computed from its stored items only. New
+        # untimed items added later must clamp back into that footprint, never
+        # spilling onto a shard that didn't collect the file (which would silently
+        # drop them).
+        durations = {f"{name}.py::t": 1.0 for name in "abcd"}
+        plan = item_plan(durations, splits=2)
+        footprint = plan.file_shards["b.py"]
+        # one stored item plus three new untimed ones, heavy enough that their
+        # tiled midpoints would cross the cut without the clamp
+        nodeids = ["b.py::t", "b.py::new1", "b.py::new2", "b.py::new3"]
+        shards = assign_file_items(plan, durations, "b.py", nodeids)
+        assert all(shard in footprint for shard in shards)
+
+    def test_zero_duration_files_still_spread_across_shards(self):
+        # All-zero stored durations must not collapse every file onto one shard
+        # (the 1µs weight floor keeps them at distinct cumulative positions).
         splits = 4
-        durations = {f"f{i}/test.py::t": 1.0 for i in range(8)}
-        plan = bucket_plan(durations, splits)
-        assert plan.num_buckets == splits
-        assert plan.bucket_widths == [1] * splits
-        assert plan.shard_bucket == list(range(splits))
+        durations = {f"f{i:02d}/test.py::t": 0.0 for i in range(40)}
+        plan = item_plan(durations, splits)
+        used = {shard for shards in plan.file_shards.values() for shard in shards}
+        assert used == set(range(splits))
 
-    def test_widens_buckets_to_absorb_an_oversized_file(self):
-        # One file far heavier than the cap forces wider buckets so stage 2 can
-        # split it across the bucket's shards.
-        splits = 8
-        durations = {"big/test.py::t": 100.0}
-        durations.update({f"f{i}/test.py::t": 1.0 for i in range(20)})
-        plan = bucket_plan(durations, splits)
-        assert plan.num_buckets < splits  # widened
-        assert max(plan.bucket_widths) > 1  # at least one multi-shard bucket
-        assert sum(plan.bucket_widths) == splits  # still exactly `splits` shards
-
-    def test_shard_maps_cover_every_shard_exactly_once(self):
-        durations = {f"f{i}/test.py::t": float(i % 5 + 1) for i in range(40)}
-        splits = 7
-        plan = bucket_plan(durations, splits)
-        assert len(plan.shard_bucket) == splits
-        assert len(plan.shard_within) == splits
-        assert sum(plan.bucket_widths) == splits
-        # within-index runs 0..width-1 inside each bucket
-        seen: dict[int, list[int]] = {}
-        for bucket, within in zip(plan.shard_bucket, plan.shard_within, strict=True):
-            seen.setdefault(bucket, []).append(within)
-        for bucket, withins in seen.items():
-            assert sorted(withins) == list(range(plan.bucket_widths[bucket]))
-
-    def test_no_durations_falls_back_to_one_file_bucket_per_shard(self):
+    def test_no_durations_leaves_everything_to_the_hash(self):
         splits = 3
-        plan = bucket_plan({}, splits)
-        assert plan.num_buckets == splits
-        assert plan.bucket_widths == [1] * splits
-        assert plan.file_bucket == {}  # everything placed by hash at collection time
+        plan = item_plan({}, splits)
+        assert plan.num_shards == splits
+        assert plan.file_shards == {}  # nothing timed; placed by hash at collect time

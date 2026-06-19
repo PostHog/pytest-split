@@ -1,9 +1,9 @@
 import enum
 import hashlib
 import heapq
-import math
 from abc import ABC, abstractmethod
-from itertools import pairwise
+from bisect import bisect_right
+from itertools import accumulate, pairwise
 from operator import itemgetter
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -372,137 +372,113 @@ def _remove_irrelevant_durations(
     return durations
 
 
-def file_group_assignment(
-    durations: "dict[str, float]", splits: int
-) -> "dict[str, int]":
-    """Assign each timed test *file* to one of ``splits`` groups (0-based).
+class ItemPlan(NamedTuple):
+    """Plan for file-level splitting with item-level balance and no artifact.
 
-    Files are weighted by the summed duration of their known tests and cut into
-    ``splits`` contiguous, order-preserving slices that minimise the slowest
-    group -- the same makespan partition ``optimal_chunks`` uses, but whole files
-    are never split. This is what makes file-granularity splitting order-safe:
-    intra-file order is always preserved, so the within-file ordering that Django
-    suites rely on can't be broken by the split.
+    The item-level optimal split is computed offline from the per-item durations.
+    That gives two things a shard uses without ever collecting the whole tree:
 
-    Only files that appear in ``durations`` are assigned here. A file with no
-    stored timing isn't known until pytest walks the tree, so the caller places
-    those at collection time via :func:`stable_group`.
+    * ``file_shards`` -- the *footprint*: which shards a file's items land on.
+      Almost every file -> one shard; only the few boundary files -> two (or
+      more, for a file heavier than one shard). ``pytest_ignore_collect`` keeps a
+      file only if this shard is in its footprint -- that's the collection saving.
+    * ``thresholds2`` + ``file_offset`` -- the *budget*: cumulative-weight cut
+      points (doubled, so the per-item midpoint stays integer). At collection time
+      each shard spends its weight budget in the file's real collection order, so
+      a shared (boundary) file is split runtime-contiguously -- order-safe,
+      exactly like the item-level algorithm.
+
+    Weights are integer microseconds, so every shard computes byte-identical cuts
+    (no float drift across processes). Indices are 0-based (``--group`` minus one).
     """
-    weights_by_file = _file_weights(durations)
-    files = sorted(weights_by_file)
-    weights = [
-        round(weights_by_file[path] * OptimalChunksAlgorithm.SCALE) for path in files
-    ]
-    boundaries = _optimal_boundaries(weights, splits)
 
-    assignment: dict[str, int] = {}
-    for group_idx, (start, end) in enumerate(pairwise(boundaries)):
-        for path in files[start:end]:
-            assignment[path] = group_idx
-    return assignment
+    num_shards: int
+    file_shards: "dict[str, list[int]]"  # file -> shards whose items touch it
+    file_offset: "dict[str, int]"  # file -> cumulative weight of all earlier files
+    file_avg: "dict[str, int]"  # file -> mean weight per item (for its untimed items)
+    thresholds2: "list[int]"  # 2 * each internal cut weight (for midpoint tiling)
 
 
-def _file_weights(durations: "dict[str, float]") -> "dict[str, float]":
-    """Summed stored duration per test file."""
-    weights: dict[str, float] = {}
-    for nodeid, dur in durations.items():
+def item_plan(durations: "dict[str, float]", splits: int) -> "ItemPlan":
+    """Compute the offline item-level split and derive footprint + weight budgets.
+
+    ``durations`` should already be scoped to the files this run collects. See
+    :class:`ItemPlan` for how the result is used.
+    """
+    scale = OptimalChunksAlgorithm.SCALE
+    items = sorted(durations)
+    # Floor at 1µs so a zero-duration test still occupies a distinct cumulative
+    # position; otherwise a whole file of ~0s tests collapses onto one shard.
+    weights = [max(1, round(durations[nodeid] * scale)) for nodeid in items]
+
+    # Items are grouped by file (the nodeid sort is path-first), so a single pass
+    # gives each file's cumulative-weight offset, total weight and mean item weight.
+    file_offset: dict[str, int] = {}
+    file_weight: dict[str, int] = {}
+    file_count: dict[str, int] = {}
+    pos = 0
+    for nodeid, weight in zip(items, weights, strict=True):
         path = _path_of(nodeid)
-        weights[path] = weights.get(path, 0.0) + dur
-    return weights
+        if path not in file_offset:
+            file_offset[path] = pos
+        file_weight[path] = file_weight.get(path, 0) + weight
+        file_count[path] = file_count.get(path, 0) + 1
+        pos += weight
+    file_avg = {path: file_weight[path] // file_count[path] for path in file_weight}
+
+    # Item-level optimal cut points as cumulative-weight thresholds, doubled so
+    # the per-item midpoint (see assign_file_items) stays an exact integer.
+    boundaries = _optimal_boundaries(weights, splits)
+    prefix = list(accumulate(weights, initial=0))  # prefix[i] = sum(weights[:i])
+    thresholds = [prefix[b] for b in boundaries[1:-1]]  # the N-1 internal cuts
+    thresholds2 = [2 * threshold for threshold in thresholds]
+
+    # Footprint: a file spans weight [offset, offset + weight); the shards that
+    # touch it are those whose ranges overlap that span.
+    file_shards: dict[str, list[int]] = {}
+    for path, offset in file_offset.items():
+        end = offset + file_weight[path]
+        first = bisect_right(thresholds, offset)
+        last = bisect_right(thresholds, max(offset, end - 1))
+        file_shards[path] = list(range(first, last + 1))
+
+    return ItemPlan(splits, file_shards, file_offset, file_avg, thresholds2)
 
 
-class BucketPlan(NamedTuple):
-    """A two-stage file -> bucket -> shard plan.
+def assign_file_items(
+    plan: "ItemPlan", durations: "dict[str, float]", path: str, nodeids: "list[str]"
+) -> "list[int]":
+    """The cut rule: the shard each of ``path``'s items belongs to, in the order
+    given (its real collection order).
 
-    Stage 1 (this plan) groups whole files into ``num_buckets`` buckets; a shard
-    only imports its bucket's files (that's the collection saving). Stage 2 then
-    splits each bucket's *collected items* across the shards assigned to that
-    bucket with the normal item-level algorithm, which recovers fine balance and
-    splits any single file too heavy for one shard.
+    A file owned outright returns the same shard for every item; a boundary file
+    is split where each item's cumulative-weight *midpoint* crosses a threshold --
+    integer math, so every shard agrees on the boundary item and the file tiles
+    exactly. Untimed items (new tests not yet in ``durations``) use the file's
+    mean item weight; the result is clamped to the file's footprint so a late
+    untimed item can never land on a shard that didn't collect the file.
 
-    Fields are indexed by 0-based shard number (``--group`` minus one).
+    ``path`` must be a timed file (present in ``plan.file_offset``).
     """
-
-    file_bucket: "dict[str, int]"  # file path -> bucket index (timed files only)
-    num_buckets: int
-    shard_bucket: "list[int]"  # shard -> its bucket
-    shard_within: "list[int]"  # shard -> its index among its bucket's shards
-    bucket_widths: "list[int]"  # bucket -> how many shards it owns
-
-
-def bucket_plan(durations: "dict[str, float]", splits: int) -> "BucketPlan":
-    """Plan stage 1: group files into buckets and hand shards to buckets.
-
-    Bucket width is chosen automatically as ``ceil(heaviest_file / ideal_cap)`` --
-    just wide enough that stage 2 can split the heaviest single file across its
-    bucket's shards. Segments with no oversized file get narrow buckets (more
-    files pruned, bigger collection saving); a segment with one giant file gets
-    wider buckets (smaller saving, but balance is kept).
-    """
-    weights_by_file = _file_weights(durations)
-    files = sorted(weights_by_file)
-    total = sum(weights_by_file.values())
-
-    if not files:
-        # No timings to balance on: one file-bucket per shard, filled by the
-        # stable hash at collection time. Keeps the collection saving (each shard
-        # still imports only its hash-share) without any duration data.
-        n = max(1, splits)
-        return BucketPlan(
-            file_bucket={},
-            num_buckets=n,
-            shard_bucket=list(range(n)),
-            shard_within=[0] * n,
-            bucket_widths=[1] * n,
+    offset2 = 2 * plan.file_offset[path]
+    avg = plan.file_avg.get(path, 0)
+    footprint = plan.file_shards[path]
+    lo, hi = footprint[0], footprint[-1]
+    shards = []
+    cumulative = 0
+    for nodeid in nodeids:
+        dur = durations.get(nodeid)
+        # Same 1µs floor as item_plan, so the cut matches the offline plan.
+        weight = (
+            max(1, round(dur * OptimalChunksAlgorithm.SCALE))
+            if dur is not None
+            else avg
         )
-
-    cap = total / splits
-    heaviest = max(weights_by_file.values())
-    width = max(1, math.ceil(heaviest / cap)) if cap > 0 else 1
-    num_buckets = max(1, splits // width)
-
-    weights = [
-        round(weights_by_file[path] * OptimalChunksAlgorithm.SCALE) for path in files
-    ]
-    boundaries = _optimal_boundaries(weights, num_buckets)
-
-    file_bucket: dict[str, int] = {}
-    bucket_weights: list[float] = []
-    for bucket, (start, end) in enumerate(pairwise(boundaries)):
-        for path in files[start:end]:
-            file_bucket[path] = bucket
-        bucket_weights.append(sum(weights_by_file[p] for p in files[start:end]))
-
-    bucket_widths = _allocate_shards(bucket_weights, splits)
-    shard_bucket: list[int] = []
-    shard_within: list[int] = []
-    for bucket, owned in enumerate(bucket_widths):
-        for within in range(owned):
-            shard_bucket.append(bucket)
-            shard_within.append(within)
-    return BucketPlan(
-        file_bucket, len(bucket_widths), shard_bucket, shard_within, bucket_widths
-    )
-
-
-def _allocate_shards(bucket_weights: "list[float]", splits: int) -> "list[int]":
-    """Hand ``splits`` shards to buckets in proportion to weight, >=1 each."""
-    total = sum(bucket_weights)
-    n = len(bucket_weights)
-    if total <= 0:
-        widths = [splits // n] * n
-        for i in range(splits - sum(widths)):
-            widths[i] += 1
-        return widths
-    widths = [max(1, round(splits * w / total)) for w in bucket_weights]
-    # Nudge to sum to exactly `splits`: shrink the most-padded / grow the leanest.
-    while sum(widths) > splits:
-        i = max((k for k in range(n) if widths[k] > 1), key=lambda k: widths[k])
-        widths[i] -= 1
-    while sum(widths) < splits:
-        i = min(range(n), key=lambda k: widths[k])
-        widths[i] += 1
-    return widths
+        midpoint2 = offset2 + 2 * cumulative + weight
+        cumulative += weight
+        shard = bisect_right(plan.thresholds2, midpoint2)
+        shards.append(min(max(shard, lo), hi))
+    return shards
 
 
 def stable_group(path: str, splits: int) -> int:

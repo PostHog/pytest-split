@@ -625,6 +625,41 @@ class TestFileGranularity:
         )
         assert sorted(_passed_test_names(result)) == ["test_r1", "test_r2"]
 
+    def test_explicit_selector_args_run_each_test_once(self, testdir, durations_path):
+        # `pytest file.py::test_x` selector args must still split exactly-once:
+        # the scope has to strip the `::selector`, and because explicit args
+        # bypass pytest_ignore_collect, untimed files must be hash-gated in
+        # modifyitems instead of kept by every shard.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_bbb="def test_b1(): pass\ndef test_b2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump({}, f)  # untimed -> hash-gated
+        selectors = [
+            "test_aaa.py::test_a1",
+            "test_aaa.py::test_a2",
+            "test_bbb.py::test_b1",
+            "test_bbb.py::test_b2",
+        ]
+        ran = []
+        for group in (1, 2):
+            result = testdir.inline_run(
+                *rootdir,
+                *selectors,
+                "--splits",
+                "2",
+                "--group",
+                str(group),
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            ran.extend(_passed_test_names(result))
+        assert sorted(ran) == ["test_a1", "test_a2", "test_b1", "test_b2"]
+
     def test_partition_excludes_ignored_files(self, testdir, durations_path):
         # An --ignore-d file is out of this run's scope, so it must not get weight
         # in the partition (nor be collected). A huge stored timing for it would

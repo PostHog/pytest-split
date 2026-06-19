@@ -115,27 +115,24 @@ collects (imports) the whole test tree, then the plugin deselects the items that
 don't belong to the current group. On a large suite that whole-tree import is the
 dominant per-shard cost — every shard imports everything just to run its slice.
 
-`--split-granularity=file` (default `item`) splits in two stages so a shard only
-imports the files it actually runs:
+`--split-granularity=file` (default `item`) makes a shard import only the files
+its own tests live in, while keeping item-level balance. It needs no extra
+artifact — everything comes from the stored `.test_durations`:
 
-1. **Stage 1 — bucket files (pre-import).** Whole files are grouped into *buckets*,
-   and each shard skips every bucket's files but its own via `pytest_ignore_collect`,
-   **before they are imported**. That's the collection saving. Bucket width is
-   chosen automatically as `ceil(heaviest_file / ideal_shard)` — just wide enough
-   for stage 2 to handle the heaviest single file.
-2. **Stage 2 — split within the bucket (post-import).** Several shards can share a
-   bucket; within it they run the configured item-level algorithm
-   (e.g. `optimal_chunks`) over the bucket's collected items and each keeps its
-   slice. This recovers fine balance and splits a too-heavy file across the
-   bucket's shards, while staying contiguous — so it's as order-safe as the
-   item-level algorithm it reuses.
-
-Wider buckets trade collection saving for balance: at one bucket per shard it's
-pure file-mode (max saving, coarsest); at one bucket total it's plain item-mode.
-The auto width lands in between, scoped per segment.
+1. **Plan (offline).** The item-level optimal split is computed from the per-test
+   durations. From it each shard learns *which files its tests live in* (a
+   "footprint"). Almost every file belongs to one shard; only the handful of
+   *boundary* files at a shard's edge belong to two.
+2. **Prune (pre-import).** `pytest_ignore_collect` skips every file not in this
+   shard's footprint, **before it is imported** — so a shard imports ~1/N of the
+   tree instead of all of it. That's the collection saving.
+3. **Tile (post-import).** The few boundary files shared by two shards are split
+   by spending a precomputed weight *budget* in the file's real collection order,
+   so the cut is runtime-contiguous (as order-safe as `optimal_chunks`) and the
+   two shards tile the file exactly.
 
 ```sh
-pytest --splits 3 --group 1 --split-granularity file --splitting-algorithm optimal_chunks
+pytest --splits 3 --group 1 --split-granularity file
 ```
 
 Notes:
@@ -145,6 +142,12 @@ Notes:
   pollute one segment's partition with another's files or stale keys.
 * Files with no stored timing (new tests) are placed deterministically, so each
   runs on exactly one shard — coverage is never dropped or duplicated.
+* The split is always the contiguous makespan-optimal one, so `--splitting-algorithm`
+  has no effect in file mode (it applies to `--split-granularity=item`).
+* Like the item-level algorithms, file mode assumes every shard collects in the
+  same order. With a test-shuffling plugin (`pytest-randomly` etc.) pin one global
+  seed across shards, or a boundary file can tile inconsistently. nbval notebook
+  regrouping (an item-mode feature) is not applied in file mode.
 
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)
