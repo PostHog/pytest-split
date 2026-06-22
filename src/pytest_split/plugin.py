@@ -25,6 +25,11 @@ STORE_DURATIONS_SETUP_AND_TEARDOWN_THRESHOLD = 60 * 10  # seconds
 # which pytest added in 7.0.
 MIN_PYTEST_FOR_FILE_GRANULARITY = 7
 
+# Capability marker so a caller (e.g. a CI workflow that may run merged with an
+# older pinned pytest-split) can feature-detect `--split-plan-path` with a plain
+# import instead of inspecting argparse, and only pass the flag when it exists.
+SUPPORTS_SPLIT_PLAN_PATH = True
+
 
 def pytest_addoption(parser: "Parser") -> None:
     """
@@ -82,6 +87,19 @@ def pytest_addoption(parser: "Parser") -> None:
         ),
         default="item",
         choices=("item", "file"),
+    )
+    group.addoption(
+        "--split-plan-path",
+        dest="split_plan_path",
+        default=None,
+        help=(
+            "For '--split-granularity=file': read the per-test durations used to build "
+            "the split *plan* from this file instead of '--durations-path'. Use it to "
+            "point a shard at a plan scoped to exactly what this run collects -- e.g. a "
+            "per-segment durations file -- when '--durations-path' is a union across "
+            "several CI jobs (whose extra tests would mis-budget the plan). Only affects "
+            "planning; '--store-durations' still writes to '--durations-path'."
+        ),
     )
     group.addoption(
         "--clean-durations",
@@ -263,7 +281,37 @@ class PytestSplitFilePlugin(Base):
         # (macOS /tmp -> /private/tmp) doesn't break the relative_to below.
         self.rootpath = config.rootpath.resolve()
         self.test_file_patterns: list[str] = config.getini("python_files")
-        self.plan = algorithms.item_plan(self._scoped_durations(config), self.splits)
+        self.plan = algorithms.item_plan(self._plan_durations(config), self.splits)
+
+    def _plan_durations(self, config: "Config") -> "dict[str, float]":
+        """Per-test durations used to build the split plan.
+
+        Default: scope ``--durations-path`` to what this run collects (see
+        :meth:`_scoped_durations`). With ``--split-plan-path`` set, read the plan from
+        that file instead -- a plan already scoped to this run (e.g. a per-segment
+        durations file), so it needs no target/ignore scoping; only stale keys whose
+        file has since been deleted are dropped. A missing plan file (cache miss before
+        the first per-segment build) falls back to the scoped durations so the shard
+        still runs.
+        """
+        plan_path = config.getoption("split_plan_path")
+        if not plan_path:
+            return self._scoped_durations(config)
+        try:
+            with open(plan_path) as f:
+                durations = json.loads(f.read())
+        except FileNotFoundError:
+            return self._scoped_durations(config)
+        on_disk: dict[str, bool] = {}
+        scoped: dict[str, float] = {}
+        for nodeid, dur in durations.items():
+            path = algorithms._path_of(nodeid)  # noqa: SLF001  (same-package helper)
+            keep = on_disk.get(path)
+            if keep is None:
+                keep = on_disk[path] = (self.rootpath / path).exists()
+            if keep:
+                scoped[nodeid] = dur
+        return scoped
 
     def _as_rel(self, target: str) -> str:
         """A pytest target (path arg or --ignore) as a rootdir-relative posix str."""

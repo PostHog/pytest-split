@@ -691,3 +691,79 @@ class TestFileGranularity:
             "file",
         )
         assert sorted(_passed_test_names(result)) == ["test_k1", "test_k2"]
+
+    def test_split_plan_path_drives_the_plan_not_durations_path(self, testdir, durations_path):
+        # --split-plan-path decouples the plan source from --durations-path: the plan
+        # is built from the plan file, while --store-durations still writes to
+        # --durations-path. Mirrors CI pointing a shard at a clean per-segment plan
+        # while the union durations file keeps collecting timings.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        plan_path = str(testdir.tmpdir.join(".plan.json"))
+        with open(plan_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        # --durations-path does not exist yet; only --store-durations writes it. If the
+        # plugin planned from --durations-path it would have no plan at all here.
+        common = (
+            *rootdir,
+            "--splits", "2",
+            "--durations-path", durations_path,
+            "--split-plan-path", plan_path,
+            "--split-granularity", "file",
+            "--store-durations",
+        )
+        group_1 = testdir.inline_run(*common, "--group", "1")
+        group_2 = testdir.inline_run(*common, "--group", "2")
+
+        # The plan came from --split-plan-path: one whole file per group, in order.
+        assert _passed_test_names(group_1) == ["test_a1", "test_a2"]
+        assert _passed_test_names(group_2) == ["test_z1", "test_z2"]
+        # --store-durations wrote to --durations-path, leaving the plan file untouched.
+        assert os.path.exists(durations_path)
+        with open(plan_path) as f:
+            assert set(json.load(f)) == {
+                "test_aaa.py::test_a1",
+                "test_aaa.py::test_a2",
+                "test_zzz.py::test_z1",
+                "test_zzz.py::test_z2",
+            }
+
+    def test_split_plan_path_missing_falls_back_to_durations(self, testdir, durations_path):
+        # A missing plan file (e.g. a cache miss before the first per-segment build)
+        # must not crash the shard -- fall back to planning from --durations-path.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        result = testdir.inline_run(
+            *rootdir,
+            "--splits", "2",
+            "--group", "1",
+            "--durations-path", durations_path,
+            "--split-plan-path", str(testdir.tmpdir.join("does-not-exist.json")),
+            "--split-granularity", "file",
+        )
+        # Fell back to --durations-path: group 1 still gets its whole file, in order.
+        assert _passed_test_names(result) == ["test_a1", "test_a2"]
