@@ -767,3 +767,37 @@ class TestFileGranularity:
         )
         # Fell back to --durations-path: group 1 still gets its whole file, in order.
         assert _passed_test_names(result) == ["test_a1", "test_a2"]
+
+    @pytest.mark.parametrize("bad", ["", "{", "{}", "   "], ids=["empty", "truncated", "no-tests", "blank"])
+    def test_split_plan_path_unusable_falls_back_to_durations(self, testdir, durations_path, bad):
+        # A present-but-unusable plan file (empty, truncated/corrupt from a partial cache
+        # restore, or a valid-but-empty {}) must fall back to --durations-path, not crash
+        # the shard or plan from nothing.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        plan_path = str(testdir.tmpdir.join(".plan.json"))
+        with open(plan_path, "w") as f:
+            f.write(bad)
+        result = testdir.inline_run(
+            *rootdir,
+            "--splits", "2",
+            "--group", "1",
+            "--durations-path", durations_path,
+            "--split-plan-path", plan_path,
+            "--split-granularity", "file",
+        )
+        # Fell back to --durations-path and ran — no crash, whole file in order.
+        assert _passed_test_names(result) == ["test_a1", "test_a2"]

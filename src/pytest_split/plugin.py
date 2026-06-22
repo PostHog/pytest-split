@@ -281,7 +281,11 @@ class PytestSplitFilePlugin(Base):
         # (macOS /tmp -> /private/tmp) doesn't break the relative_to below.
         self.rootpath = config.rootpath.resolve()
         self.test_file_patterns: list[str] = config.getini("python_files")
-        self.plan = algorithms.item_plan(self._plan_durations(config), self.splits)
+        # Keep the exact durations the plan was built from: the boundary-file cut in
+        # pytest_collection_modifyitems must read per-item weights from the same source
+        # as the plan's thresholds, or the runtime split diverges from the plan.
+        self.plan_durations = self._plan_durations(config)
+        self.plan = algorithms.item_plan(self.plan_durations, self.splits)
 
     def _plan_durations(self, config: "Config") -> "dict[str, float]":
         """Per-test durations used to build the split plan.
@@ -290,9 +294,10 @@ class PytestSplitFilePlugin(Base):
         :meth:`_scoped_durations`). With ``--split-plan-path`` set, read the plan from
         that file instead -- a plan already scoped to this run (e.g. a per-segment
         durations file), so it needs no target/ignore scoping; only stale keys whose
-        file has since been deleted are dropped. A missing plan file (cache miss before
-        the first per-segment build) falls back to the scoped durations so the shard
-        still runs.
+        file has since been deleted are dropped. An unusable plan file -- missing
+        (cache miss before the first per-segment build), empty, or corrupt/truncated (a
+        partial cache restore) -- falls back to the scoped durations so the shard still
+        runs balanced instead of crashing or planning from nothing.
         """
         plan_path = config.getoption("split_plan_path")
         if not plan_path:
@@ -300,7 +305,9 @@ class PytestSplitFilePlugin(Base):
         try:
             with open(plan_path) as f:
                 durations = json.loads(f.read())
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):  # ValueError covers JSONDecodeError
+            return self._scoped_durations(config)
+        if not durations:
             return self._scoped_durations(config)
         on_disk: dict[str, bool] = {}
         scoped: dict[str, float] = {}
@@ -419,7 +426,7 @@ class PytestSplitFilePlugin(Base):
                 (kept if owner == self.group_idx else deselected).extend(file_items)
                 continue
             shards = algorithms.assign_file_items(
-                plan, self.cached_durations, path, [item.nodeid for item in file_items]
+                plan, self.plan_durations, path, [item.nodeid for item in file_items]
             )
             for item, shard in zip(file_items, shards, strict=True):
                 (kept if shard == self.group_idx else deselected).append(item)
