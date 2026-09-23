@@ -660,6 +660,40 @@ class TestFileGranularity:
             ran.extend(_passed_test_names(result))
         assert sorted(ran) == ["test_a1", "test_a2", "test_b1", "test_b2"]
 
+    def test_relative_targets_resolve_from_the_invocation_dir(
+        self, testdir, durations_path, monkeypatch
+    ):
+        # A run started below rootdir (`cd pkg && pytest --rootdir .. tests`) names its
+        # targets relative to where it started. Resolved against rootdir, they scoped
+        # every stored timing away and each shard fell back to hash placement.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        tests_dir = testdir.tmpdir.mkdir("pkg").mkdir("tests")
+        tests_dir.join("test_heavy.py").write("def test_h(): pass\n")
+        durations = {"pkg/tests/test_heavy.py::test_h": 3.0}
+        for name in ("a", "b", "c"):
+            tests_dir.join(f"test_light_{name}.py").write(f"def test_{name}(): pass\n")
+            durations[f"pkg/tests/test_light_{name}.py::test_{name}"] = 1.0
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+        monkeypatch.chdir(testdir.tmpdir.join("pkg"))
+
+        per_group = []
+        for group in ("1", "2"):
+            result = testdir.inline_run(
+                *rootdir,
+                "tests",
+                "--splits",
+                "2",
+                "--group",
+                group,
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            per_group.append(sorted(_passed_test_names(result)))
+        assert per_group == [["test_h"], ["test_a", "test_b", "test_c"]]
+
     def test_partition_excludes_ignored_files(self, testdir, durations_path):
         # An --ignore-d file is out of this run's scope, so it must not get weight
         # in the partition (nor be collected). A huge stored timing for it would
@@ -692,7 +726,9 @@ class TestFileGranularity:
         )
         assert sorted(_passed_test_names(result)) == ["test_k1", "test_k2"]
 
-    def test_split_plan_path_drives_the_plan_not_durations_path(self, testdir, durations_path):
+    def test_split_plan_path_drives_the_plan_not_durations_path(
+        self, testdir, durations_path
+    ):
         # --split-plan-path decouples the plan source from --durations-path: the plan
         # is built from the plan file, while --store-durations still writes to
         # --durations-path. Mirrors CI pointing a shard at a clean per-segment plan
@@ -717,10 +753,14 @@ class TestFileGranularity:
         # plugin planned from --durations-path it would have no plan at all here.
         common = (
             *rootdir,
-            "--splits", "2",
-            "--durations-path", durations_path,
-            "--split-plan-path", plan_path,
-            "--split-granularity", "file",
+            "--splits",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            plan_path,
+            "--split-granularity",
+            "file",
             "--store-durations",
         )
         group_1 = testdir.inline_run(*common, "--group", "1")
@@ -739,7 +779,9 @@ class TestFileGranularity:
                 "test_zzz.py::test_z2",
             }
 
-    def test_split_plan_path_missing_falls_back_to_durations(self, testdir, durations_path):
+    def test_split_plan_path_missing_falls_back_to_durations(
+        self, testdir, durations_path
+    ):
         # A missing plan file (e.g. a cache miss before the first per-segment build)
         # must not crash the shard -- fall back to planning from --durations-path.
         rootdir = ("--rootdir", str(testdir.tmpdir))
@@ -759,17 +801,26 @@ class TestFileGranularity:
             )
         result = testdir.inline_run(
             *rootdir,
-            "--splits", "2",
-            "--group", "1",
-            "--durations-path", durations_path,
-            "--split-plan-path", str(testdir.tmpdir.join("does-not-exist.json")),
-            "--split-granularity", "file",
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            str(testdir.tmpdir.join("does-not-exist.json")),
+            "--split-granularity",
+            "file",
         )
         # Fell back to --durations-path: group 1 still gets its whole file, in order.
         assert _passed_test_names(result) == ["test_a1", "test_a2"]
 
-    @pytest.mark.parametrize("bad", ["", "{", "{}", "   "], ids=["empty", "truncated", "no-tests", "blank"])
-    def test_split_plan_path_unusable_falls_back_to_durations(self, testdir, durations_path, bad):
+    @pytest.mark.parametrize(
+        "bad", ["", "{", "{}", "   "], ids=["empty", "truncated", "no-tests", "blank"]
+    )
+    def test_split_plan_path_unusable_falls_back_to_durations(
+        self, testdir, durations_path, bad
+    ):
         # A present-but-unusable plan file (empty, truncated/corrupt from a partial cache
         # restore, or a valid-but-empty {}) must fall back to --durations-path, not crash
         # the shard or plan from nothing.
@@ -793,11 +844,16 @@ class TestFileGranularity:
             f.write(bad)
         result = testdir.inline_run(
             *rootdir,
-            "--splits", "2",
-            "--group", "1",
-            "--durations-path", durations_path,
-            "--split-plan-path", plan_path,
-            "--split-granularity", "file",
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            plan_path,
+            "--split-granularity",
+            "file",
         )
         # Fell back to --durations-path and ran — no crash, whole file in order.
         assert _passed_test_names(result) == ["test_a1", "test_a2"]

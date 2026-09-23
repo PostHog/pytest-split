@@ -1,7 +1,7 @@
 import hashlib
 import itertools
 from collections import namedtuple
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -131,7 +131,10 @@ class TestAlgorithms:
             item("slow/test_b.py::test_new"),
         ]
         estimated = {
-            it.nodeid: dur for it, dur in _get_items_with_durations(items, durations)
+            it.nodeid: dur
+            for it, dur in _get_items_with_durations(
+                cast("list[Item]", items), durations
+            )
         }
         assert estimated["fast/test_a.py::test_new"] == fast_avg
         assert estimated["slow/test_b.py::test_new"] == slow_avg
@@ -146,7 +149,10 @@ class TestAlgorithms:
             item("dir/test_new_file.py::test_1")
         ]
         estimated = {
-            it.nodeid: dur for it, dur in _get_items_with_durations(items, durations)
+            it.nodeid: dur
+            for it, dur in _get_items_with_durations(
+                cast("list[Item]", items), durations
+            )
         }
         directory_average = (2.0 + 4.0) / 2
         assert estimated["dir/test_new_file.py::test_1"] == directory_average
@@ -161,7 +167,10 @@ class TestAlgorithms:
             item("brand/new/test_z.py::test_1")
         ]
         estimated = {
-            it.nodeid: dur for it, dur in _get_items_with_durations(items, durations)
+            it.nodeid: dur
+            for it, dur in _get_items_with_durations(
+                cast("list[Item]", items), durations
+            )
         }
         global_average = (2.0 + 4.0) / 2
         assert estimated["brand/new/test_z.py::test_1"] == global_average

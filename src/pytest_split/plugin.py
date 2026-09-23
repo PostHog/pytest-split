@@ -280,6 +280,9 @@ class PytestSplitFilePlugin(Base):
         # nodeids are relative to rootpath. resolve() so the symlinked-tmp case
         # (macOS /tmp -> /private/tmp) doesn't break the relative_to below.
         self.rootpath = config.rootpath.resolve()
+        # pytest reads relative path args and --ignore from the directory it was
+        # invoked in, which differs from rootdir when a run uses --rootdir.
+        self.invocation_dir = Path(config.invocation_params.dir).resolve()
         self.test_file_patterns: list[str] = config.getini("python_files")
         # Keep the exact durations the plan was built from: the boundary-file cut in
         # pytest_collection_modifyitems must read per-item weights from the same source
@@ -325,7 +328,7 @@ class PytestSplitFilePlugin(Base):
         target = target.split("::", 1)[0]  # drop any `::test_name` selector
         path = Path(target)
         if not path.is_absolute():
-            path = self.rootpath / path
+            path = self.invocation_dir / path
         try:
             return path.resolve().relative_to(self.rootpath).as_posix()
         except ValueError:
