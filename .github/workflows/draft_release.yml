@@ -18,9 +18,9 @@ jobs:
         id: updated_version
         shell: bash
         env:
-          VERSION: ${{ github.event.inputs.version }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
         run: |
-          poetry version "$VERSION"
+          poetry version "$REQUESTED_VERSION"
           version=$(poetry version --short)
           echo ::set-output name="version::$version"
       - name: Update changelog
