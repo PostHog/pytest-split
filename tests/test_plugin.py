@@ -434,3 +434,426 @@ class TestHasExpectedOutput:
 
 def _passed_test_names(result):
     return [passed.nodeid.split("::")[-1] for passed in result.listoutcomes()[0]]
+
+
+class TestFileGranularity:
+    def test_partitions_whole_files_across_groups(self, testdir, durations_path):
+        # --rootdir pins the frame so the hand-written durations (keyed to that
+        # root) match the collected paths. pytester otherwise drifts rootdir
+        # between runs; CI always stores and splits from one repo root.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+
+        group_1 = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        group_2 = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "2",
+            "--group",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+
+        # one whole file per group -- each runs exactly its file's tests, in order
+        assert _passed_test_names(group_1) == ["test_a1", "test_a2"]
+        assert _passed_test_names(group_2) == ["test_z1", "test_z2"]
+
+    def test_skips_other_groups_files_before_import(self, testdir, durations_path):
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        testdir.runpytest("--store-durations", "--durations-path", durations_path)
+        # make the second file blow up the moment it is imported (collected)
+        testdir.makepyfile(test_zzz="raise RuntimeError('test_zzz was imported')\n")
+
+        # group 1 owns test_aaa -> test_zzz is pruned before import, so no error
+        owner_of_aaa = testdir.runpytest_subprocess(
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert owner_of_aaa.ret == ExitCode.OK
+        owner_of_aaa.assert_outcomes(passed=2)
+
+        # group 2 owns test_zzz -> it IS imported, so the raise surfaces. This is
+        # the converse that proves the skip above is real, not unconditional.
+        owner_of_zzz = testdir.runpytest_subprocess(
+            "--splits",
+            "2",
+            "--group",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert owner_of_zzz.ret != ExitCode.OK
+        owner_of_zzz.stdout.fnmatch_lines(["*test_zzz was imported*"])
+
+    def test_covers_every_untimed_file_exactly_once(self, testdir, durations_path):
+        testdir.makepyfile(
+            test_aaa="def test_a(): pass\n",
+            test_bbb="def test_b(): pass\n",
+            test_ccc="def test_c(): pass\n",
+        )
+        # no stored durations -> every file is placed by the stable hash fallback
+        with open(durations_path, "w") as f:
+            json.dump({}, f)
+
+        splits = 3
+        ran = []
+        for group in range(1, splits + 1):
+            result = testdir.inline_run(
+                "--splits",
+                str(splits),
+                "--group",
+                str(group),
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            ran.extend(_passed_test_names(result))
+
+        # each file ran on exactly one group -- full coverage, no duplication
+        assert sorted(ran) == ["test_a", "test_b", "test_c"]
+
+    def test_file_granularity_requires_modern_pytest(self, testdir, monkeypatch):
+        # The pre-import hook (collection_path) is pytest>=7; older pytest would
+        # silently drop it, so the option must fail loudly there instead.
+        monkeypatch.setattr(pytest, "__version__", "6.2.5")
+        testdir.makepyfile(test_x="def test_1(): pass\n")
+        result = testdir.runpytest(
+            "--splits", "2", "--group", "1", "--split-granularity", "file"
+        )
+        assert result.ret == ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(["*requires pytest>=7*"])
+
+    def test_oversized_file_is_split_across_its_bucket(self, testdir, durations_path):
+        # A file far heavier than one shard widens its bucket; stage 2 then splits
+        # that file's items across the bucket's shards -- so both shards collect it
+        # (the overlap) and each runs part of it. Neither shard is left empty.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_heavy="".join(f"def test_h{i}(): pass\n" for i in range(6)),
+            test_light="def test_l1(): pass\ndef test_l2(): pass\n",
+        )
+        durations = {f"test_heavy.py::test_h{i}": 10.0 for i in range(6)}
+        durations.update({"test_light.py::test_l1": 1.0, "test_light.py::test_l2": 1.0})
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+
+        runs = [
+            testdir.inline_run(
+                *rootdir,
+                "--splits",
+                "2",
+                "--group",
+                str(g),
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            for g in (1, 2)
+        ]
+        per_shard = [_passed_test_names(r) for r in runs]
+
+        # full coverage, each test exactly once
+        assert sorted(per_shard[0] + per_shard[1]) == sorted(
+            [f"test_h{i}" for i in range(6)] + ["test_l1", "test_l2"]
+        )
+        # the heavy file was actually split: both shards ran something
+        assert per_shard[0]
+        assert per_shard[1]
+
+    def test_partition_ignores_stale_durations(self, testdir, durations_path):
+        # A heavy stored timing for a file that no longer exists must not warp the
+        # partition (or send a shard chasing a file that isn't there).
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(test_real="def test_r1(): pass\ndef test_r2(): pass\n")
+        durations = {
+            "test_real.py::test_r1": 1.0,
+            "test_real.py::test_r2": 1.0,
+            "test_deleted.py::test_x": 9999.0,  # stale: not on disk
+        }
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+
+        result = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "1",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert sorted(_passed_test_names(result)) == ["test_r1", "test_r2"]
+
+    def test_explicit_selector_args_run_each_test_once(self, testdir, durations_path):
+        # `pytest file.py::test_x` selector args must still split exactly-once:
+        # the scope has to strip the `::selector`, and because explicit args
+        # bypass pytest_ignore_collect, untimed files must be hash-gated in
+        # modifyitems instead of kept by every shard.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_bbb="def test_b1(): pass\ndef test_b2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump({}, f)  # untimed -> hash-gated
+        selectors = [
+            "test_aaa.py::test_a1",
+            "test_aaa.py::test_a2",
+            "test_bbb.py::test_b1",
+            "test_bbb.py::test_b2",
+        ]
+        ran = []
+        for group in (1, 2):
+            result = testdir.inline_run(
+                *rootdir,
+                *selectors,
+                "--splits",
+                "2",
+                "--group",
+                str(group),
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            ran.extend(_passed_test_names(result))
+        assert sorted(ran) == ["test_a1", "test_a2", "test_b1", "test_b2"]
+
+    def test_relative_targets_resolve_from_the_invocation_dir(
+        self, testdir, durations_path, monkeypatch
+    ):
+        # A run started below rootdir (`cd pkg && pytest --rootdir .. tests`) names its
+        # targets relative to where it started. Resolved against rootdir, they scoped
+        # every stored timing away and each shard fell back to hash placement.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        tests_dir = testdir.tmpdir.mkdir("pkg").mkdir("tests")
+        tests_dir.join("test_heavy.py").write("def test_h(): pass\n")
+        durations = {"pkg/tests/test_heavy.py::test_h": 3.0}
+        for name in ("a", "b", "c"):
+            tests_dir.join(f"test_light_{name}.py").write(f"def test_{name}(): pass\n")
+            durations[f"pkg/tests/test_light_{name}.py::test_{name}"] = 1.0
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+        monkeypatch.chdir(testdir.tmpdir.join("pkg"))
+
+        per_group = []
+        for group in ("1", "2"):
+            result = testdir.inline_run(
+                *rootdir,
+                "tests",
+                "--splits",
+                "2",
+                "--group",
+                group,
+                "--durations-path",
+                durations_path,
+                "--split-granularity",
+                "file",
+            )
+            per_group.append(sorted(_passed_test_names(result)))
+        assert per_group == [["test_h"], ["test_a", "test_b", "test_c"]]
+
+    def test_partition_excludes_ignored_files(self, testdir, durations_path):
+        # An --ignore-d file is out of this run's scope, so it must not get weight
+        # in the partition (nor be collected). A huge stored timing for it would
+        # otherwise warp the buckets.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_kept="def test_k1(): pass\ndef test_k2(): pass\n",
+            test_skipped="def test_s1(): pass\n",
+        )
+        durations = {
+            "test_kept.py::test_k1": 1.0,
+            "test_kept.py::test_k2": 1.0,
+            "test_skipped.py::test_s1": 9999.0,
+        }
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+
+        result = testdir.inline_run(
+            *rootdir,
+            "--ignore",
+            "test_skipped.py",
+            "--splits",
+            "1",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-granularity",
+            "file",
+        )
+        assert sorted(_passed_test_names(result)) == ["test_k1", "test_k2"]
+
+    def test_split_plan_path_drives_the_plan_not_durations_path(
+        self, testdir, durations_path
+    ):
+        # --split-plan-path decouples the plan source from --durations-path: the plan
+        # is built from the plan file, while --store-durations still writes to
+        # --durations-path. Mirrors CI pointing a shard at a clean per-segment plan
+        # while the union durations file keeps collecting timings.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        plan_path = str(testdir.tmpdir.join(".plan.json"))
+        with open(plan_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        # --durations-path does not exist yet; only --store-durations writes it. If the
+        # plugin planned from --durations-path it would have no plan at all here.
+        common = (
+            *rootdir,
+            "--splits",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            plan_path,
+            "--split-granularity",
+            "file",
+            "--store-durations",
+        )
+        group_1 = testdir.inline_run(*common, "--group", "1")
+        group_2 = testdir.inline_run(*common, "--group", "2")
+
+        # The plan came from --split-plan-path: one whole file per group, in order.
+        assert _passed_test_names(group_1) == ["test_a1", "test_a2"]
+        assert _passed_test_names(group_2) == ["test_z1", "test_z2"]
+        # --store-durations wrote to --durations-path, leaving the plan file untouched.
+        assert os.path.exists(durations_path)
+        with open(plan_path) as f:
+            assert set(json.load(f)) == {
+                "test_aaa.py::test_a1",
+                "test_aaa.py::test_a2",
+                "test_zzz.py::test_z1",
+                "test_zzz.py::test_z2",
+            }
+
+    def test_split_plan_path_missing_falls_back_to_durations(
+        self, testdir, durations_path
+    ):
+        # A missing plan file (e.g. a cache miss before the first per-segment build)
+        # must not crash the shard -- fall back to planning from --durations-path.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        result = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            str(testdir.tmpdir.join("does-not-exist.json")),
+            "--split-granularity",
+            "file",
+        )
+        # Fell back to --durations-path: group 1 still gets its whole file, in order.
+        assert _passed_test_names(result) == ["test_a1", "test_a2"]
+
+    @pytest.mark.parametrize(
+        "bad", ["", "{", "{}", "   "], ids=["empty", "truncated", "no-tests", "blank"]
+    )
+    def test_split_plan_path_unusable_falls_back_to_durations(
+        self, testdir, durations_path, bad
+    ):
+        # A present-but-unusable plan file (empty, truncated/corrupt from a partial cache
+        # restore, or a valid-but-empty {}) must fall back to --durations-path, not crash
+        # the shard or plan from nothing.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        plan_path = str(testdir.tmpdir.join(".plan.json"))
+        with open(plan_path, "w") as f:
+            f.write(bad)
+        result = testdir.inline_run(
+            *rootdir,
+            "--splits",
+            "2",
+            "--group",
+            "1",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            plan_path,
+            "--split-granularity",
+            "file",
+        )
+        # Fell back to --durations-path and ran — no crash, whole file in order.
+        assert _passed_test_names(result) == ["test_a1", "test_a2"]

@@ -4,9 +4,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- New `--split-granularity` option (`item` default, or `file`). `file` makes a
+  shard import only the files its own tests live in, with no extra artifact: the
+  item-level optimal split is computed offline from `.test_durations`, giving each
+  shard a per-file "footprint" used to skip other files via `pytest_ignore_collect`
+  (before import — the collection saving) and a weight "budget" used to tile the
+  few boundary files in collection order (runtime-contiguous, so as order-safe as
+  the item-level split, and item-level balanced). The durations universe is scoped
+  to the run's targets (minus `--ignore`, minus files no longer on disk), so a
+  multi-segment CI doesn't cross-pollute or carry stale keys. Untimed files are
+  placed deterministically. Requires pytest >= 7.
+- New `optimal_chunks` splitting algorithm. Like `duration_based_chunks` it keeps
+  tests in contiguous, in-order groups (so it never scatters tests the way
+  `least_duration` does), but it computes the cut points that minimise the
+  slowest group's duration instead of using a greedy rule. Useful for suites with
+  implicit inter-test ordering (e.g. Django `TestCase`/`TransactionTestCase`)
+  where `least_duration` would expose latent ordering dependencies.
+- Estimate the duration of tests with no stored timing from their file's average,
+  falling back to the directory average and then the global average (previously
+  always the global average). This gives much closer estimates on suites with
+  uneven per-file runtimes — most relevant for newly added tests, which would
+  otherwise all be guessed at the suite-wide mean and skew a single shard.
+
 ### Fixed
 - Fix malformed bullet points rendering in GitHub Pages documentation
-- Emit valid pytest dependency metadata with current Poetry build backends
 
 ## [0.11.0] - 2026-02-03
 ### Added

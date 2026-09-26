@@ -1,5 +1,7 @@
+import fnmatch
 import json
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,6 +20,15 @@ if TYPE_CHECKING:
 
 # Ugly hack for freezegun compatibility: https://github.com/spulec/freezegun/issues/286
 STORE_DURATIONS_SETUP_AND_TEARDOWN_THRESHOLD = 60 * 10  # seconds
+
+# `--split-granularity=file` relies on the `collection_path` ignore-collect hook,
+# which pytest added in 7.0.
+MIN_PYTEST_FOR_FILE_GRANULARITY = 7
+
+# Capability marker so a caller (e.g. a CI workflow that may run merged with an
+# older pinned pytest-split) can feature-detect `--split-plan-path` with a plain
+# import instead of inspecting argparse, and only pass the flag when it exists.
+SUPPORTS_SPLIT_PLAN_PATH = True
 
 
 def pytest_addoption(parser: "Parser") -> None:
@@ -64,6 +75,33 @@ def pytest_addoption(parser: "Parser") -> None:
         choices=algorithms.Algorithms.names(),
     )
     group.addoption(
+        "--split-granularity",
+        dest="split_granularity",
+        type=str,
+        help=(
+            "What to split on. 'item' (default) splits individual tests after the "
+            "whole suite is collected. 'file' assigns whole test files to groups and "
+            "skips other groups' files before they are imported -- this avoids "
+            "collecting (importing) the entire tree on every shard, which is the "
+            "dominant per-shard cost on a large suite."
+        ),
+        default="item",
+        choices=("item", "file"),
+    )
+    group.addoption(
+        "--split-plan-path",
+        dest="split_plan_path",
+        default=None,
+        help=(
+            "For '--split-granularity=file': read the per-test durations used to build "
+            "the split *plan* from this file instead of '--durations-path'. Use it to "
+            "point a shard at a plan scoped to exactly what this run collects -- e.g. a "
+            "per-segment durations file -- when '--durations-path' is a union across "
+            "several CI jobs (whose extra tests would mis-budget the plan). Only affects "
+            "planning; '--store-durations' still writes to '--durations-path'."
+        ),
+    )
+    group.addoption(
         "--clean-durations",
         dest="clean_durations",
         action="store_true",
@@ -97,6 +135,19 @@ def pytest_cmdline_main(config: "Config") -> "int | ExitCode | None":
     if group < 1 or group > splits:
         raise pytest.UsageError(f"argument `--group` must be >= 1 and <= {splits}")
 
+    pytest_major = int(pytest.__version__.split(".", 1)[0])
+    if (
+        config.option.split_granularity == "file"
+        and pytest_major < MIN_PYTEST_FOR_FILE_GRANULARITY
+    ):
+        # File granularity prunes via the `collection_path` ignore-collect hook,
+        # added in pytest 7. On older pytest the hook would be silently dropped
+        # (every shard would then run every file), so fail loudly instead.
+        raise pytest.UsageError(
+            "`--split-granularity=file` requires pytest>=7; "
+            "use the default `--split-granularity=item` on older pytest"
+        )
+
     return None
 
 
@@ -105,7 +156,14 @@ def pytest_configure(config: "Config") -> None:
     Enable the plugins we need.
     """
     if config.option.splits and config.option.group:
-        config.pluginmanager.register(PytestSplitPlugin(config), "pytestsplitplugin")
+        if config.option.split_granularity == "file":
+            config.pluginmanager.register(
+                PytestSplitFilePlugin(config), "pytestsplitfileplugin"
+            )
+        else:
+            config.pluginmanager.register(
+                PytestSplitPlugin(config), "pytestsplitplugin"
+            )
 
     if config.option.store_durations:
         config.pluginmanager.register(
@@ -178,6 +236,214 @@ class PytestSplitPlugin(Base):
                 f"[pytest-split] Running group {group_idx}/{splits} (estimated duration: {group.duration:.2f}s)\n"
             )
         )
+
+
+def _under_any(path: str, prefixes: "list[str]") -> bool:
+    """True if ``path`` is one of, or under, any of ``prefixes`` (a rootdir
+    prefix of ``""``/``"."`` matches everything)."""
+    for prefix in prefixes:
+        if prefix in ("", "."):
+            return True
+        if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+            return True
+    return False
+
+
+class PytestSplitFilePlugin(Base):
+    """
+    File-granularity splitting that keeps item-level balance, with no artifact.
+
+    The item-level optimal split is computed offline from the per-item durations
+    (see :func:`algorithms.item_plan`). From it each shard learns, before pytest
+    imports anything, *which files its tests live in* -- so:
+
+    * ``pytest_ignore_collect`` (pre-import) skips every file this shard has no
+      tests in. Almost every file belongs to one shard, so a shard imports only
+      ~1/N of the tree instead of all of it -- that's the collection saving, and
+      the dominant per-shard cost on a large suite.
+    * ``pytest_collection_modifyitems`` (post-import) splits the few *boundary*
+      files shared by two shards: each shard spends a precomputed weight budget in
+      the file's real collection order, so the cut is runtime-contiguous (order-
+      safe, like the item-level algorithm) and the two shards tile the file
+      exactly.
+
+    The durations universe is scoped to what this run actually collects (its target
+    paths, minus ``--ignore``, minus files no longer on disk), so a multi-segment CI
+    can't pollute one segment's partition with another segment's files or with stale
+    keys for deleted tests.
+    """
+
+    def __init__(self, config: "Config") -> None:
+        super().__init__(config)
+        self.splits: int = config.option.splits
+        self.group_idx: int = config.option.group - 1  # 0-based
+        # nodeids are relative to rootpath. resolve() so the symlinked-tmp case
+        # (macOS /tmp -> /private/tmp) doesn't break the relative_to below.
+        self.rootpath = config.rootpath.resolve()
+        # pytest reads relative path args and --ignore from the directory it was
+        # invoked in, which differs from rootdir when a run uses --rootdir.
+        self.invocation_dir = Path(config.invocation_params.dir).resolve()
+        self.test_file_patterns: list[str] = config.getini("python_files")
+        # Keep the exact durations the plan was built from: the boundary-file cut in
+        # pytest_collection_modifyitems must read per-item weights from the same source
+        # as the plan's thresholds, or the runtime split diverges from the plan.
+        self.plan_durations = self._plan_durations(config)
+        self.plan = algorithms.item_plan(self.plan_durations, self.splits)
+
+    def _plan_durations(self, config: "Config") -> "dict[str, float]":
+        """Per-test durations used to build the split plan.
+
+        Default: scope ``--durations-path`` to what this run collects (see
+        :meth:`_scoped_durations`). With ``--split-plan-path`` set, read the plan from
+        that file instead -- a plan already scoped to this run (e.g. a per-segment
+        durations file), so it needs no target/ignore scoping; only stale keys whose
+        file has since been deleted are dropped. An unusable plan file -- missing
+        (cache miss before the first per-segment build), empty, or corrupt/truncated (a
+        partial cache restore) -- falls back to the scoped durations so the shard still
+        runs balanced instead of crashing or planning from nothing.
+        """
+        plan_path = config.getoption("split_plan_path")
+        if not plan_path:
+            return self._scoped_durations(config)
+        try:
+            with open(plan_path) as f:
+                durations = json.loads(f.read())
+        except (FileNotFoundError, ValueError):  # ValueError covers JSONDecodeError
+            return self._scoped_durations(config)
+        if not durations:
+            return self._scoped_durations(config)
+        on_disk: dict[str, bool] = {}
+        scoped: dict[str, float] = {}
+        for nodeid, dur in durations.items():
+            path = algorithms._path_of(nodeid)  # noqa: SLF001  (same-package helper)
+            keep = on_disk.get(path)
+            if keep is None:
+                keep = on_disk[path] = (self.rootpath / path).exists()
+            if keep:
+                scoped[nodeid] = dur
+        return scoped
+
+    def _as_rel(self, target: str) -> str:
+        """A pytest target (path arg or --ignore) as a rootdir-relative posix str."""
+        target = target.split("::", 1)[0]  # drop any `::test_name` selector
+        path = Path(target)
+        if not path.is_absolute():
+            path = self.invocation_dir / path
+        try:
+            return path.resolve().relative_to(self.rootpath).as_posix()
+        except ValueError:
+            return Path(target).as_posix().rstrip("/")
+
+    def _scoped_durations(self, config: "Config") -> "dict[str, float]":
+        """Durations restricted to files this run collects: under a target path,
+        not ``--ignore``-d, and still present on disk (drops stale keys)."""
+        targets = [self._as_rel(a) for a in (config.args or [])]
+        ignores = [self._as_rel(i) for i in (config.getoption("ignore") or [])]
+        ignore_globs = config.getoption("ignore_glob") or []
+
+        # The accept/reject decision is per *file*, so cache it and pay the
+        # prefix checks + stat once per file rather than once per test nodeid.
+        keep_file: dict[str, bool] = {}
+
+        def in_scope(path: str) -> bool:
+            return (
+                (not targets or _under_any(path, targets))
+                and not _under_any(path, ignores)
+                and not any(fnmatch.fnmatch(path, glob) for glob in ignore_globs)
+                and (self.rootpath / path).exists()  # drops stale keys
+            )
+
+        scoped: dict[str, float] = {}
+        for nodeid, dur in self.cached_durations.items():
+            path = algorithms._path_of(nodeid)  # noqa: SLF001  (same-package helper)
+            keep = keep_file.get(path)
+            if keep is None:
+                keep = keep_file[path] = in_scope(path)
+            if keep:
+                scoped[nodeid] = dur
+        return scoped
+
+    def _is_test_file(self, name: str) -> bool:
+        return any(
+            fnmatch.fnmatch(name, pattern) for pattern in self.test_file_patterns
+        )
+
+    def _collects_file(self, rel_path: str) -> bool:
+        """Whether this shard has any tests in ``rel_path`` (so must import it)."""
+        shards = self.plan.file_shards.get(rel_path)
+        if shards is None:
+            # New file with no stored timing: place it on one shard deterministically.
+            return algorithms.stable_group(rel_path, self.plan.num_shards) == (
+                self.group_idx
+            )
+        return self.group_idx in shards
+
+    def pytest_ignore_collect(self, collection_path: "Path") -> "bool | None":
+        # The pre-import gate. Only decide for test files; returning None for
+        # directories lets pytest recurse, and for non-test files (conftest.py,
+        # helpers) leaves them untouched.
+        if not self._is_test_file(collection_path.name):
+            return None
+        try:
+            rel_path = collection_path.relative_to(self.rootpath).as_posix()
+        except ValueError:  # pragma: no cover
+            # Fast path failed: rootpath/collection_path can disagree on symlinks.
+            # Resolve the file (slow path only) and retry before giving up.
+            try:
+                rel_path = (
+                    collection_path.resolve().relative_to(self.rootpath).as_posix()
+                )
+            except ValueError:
+                return None  # genuinely outside rootdir -- don't second-guess pytest
+        if self._collects_file(rel_path):
+            return None  # our file: collect it (boundary files then split below)
+        return True  # no tests of ours here: skip it before it is imported
+
+    @hookimpl(trylast=True)
+    def pytest_collection_modifyitems(
+        self, config: "Config", items: "list[nodes.Item]"
+    ) -> None:
+        # Keep this shard's items. A file we own outright keeps all its items; a
+        # boundary file (shared with a neighbour) is split by the cut rule in
+        # algorithms.assign_file_items -- each shard spends its weight budget in
+        # the file's real collection order, so the cut is runtime-contiguous and
+        # the two shards tile the file exactly.
+        plan = self.plan
+        kept: list[nodes.Item] = []
+        deselected: list[nodes.Item] = []
+
+        by_file: dict[str, list[nodes.Item]] = {}
+        for item in items:
+            by_file.setdefault(
+                algorithms._path_of(item.nodeid),  # noqa: SLF001  (same-package helper)
+                [],
+            ).append(item)
+
+        for path, file_items in by_file.items():
+            if path not in plan.file_offset:
+                # Untimed file: keep it only if we are its hash owner. ignore_collect
+                # already gates this for walked files, but files named explicitly on
+                # the command line bypass ignore_collect, so decide authoritatively
+                # here to stay exactly-once.
+                owner = algorithms.stable_group(path, plan.num_shards)
+                (kept if owner == self.group_idx else deselected).extend(file_items)
+                continue
+            shards = algorithms.assign_file_items(
+                plan, self.plan_durations, path, [item.nodeid for item in file_items]
+            )
+            for item, shard in zip(file_items, shards, strict=True):
+                (kept if shard == self.group_idx else deselected).append(item)
+
+        items[:] = kept
+        config.hook.pytest_deselected(items=deselected)
+
+    def pytest_report_collectionfinish(self) -> "list[str]":
+        return [
+            self.writer.markup(
+                f"[pytest-split] Splitting by file (item-plan), group "
+                f"{self.group_idx + 1}/{self.splits}"
+            )
+        ]
 
 
 class PytestSplitCachePlugin(Base):

@@ -72,12 +72,14 @@ where the letters (A to E) refer to individual IPython Notebooks, and the number
 
 ## Splitting algorithms
 The plugin supports multiple algorithms to split tests into groups.
-Each algorithm makes different tradeoffs, but generally `least_duration` should give more balanced groups.
+Each algorithm makes different tradeoffs between how balanced the groups are and
+whether the original test order is preserved.
 
 | Algorithm      | Maintains Absolute Order | Maintains Relative Order | Split Quality | Works with random ordering |
 |----------------|--------------------------|--------------------------|---------------|----------------------------|
 | duration_based_chunks | ✅                | ✅                       | Good          | ❌                         |
-| least_duration | ❌                       | ✅                       | Better        | ✅                         |
+| optimal_chunks | ✅                       | ✅                       | Best (order-preserving) | ❌               |
+| least_duration | ❌                       | ✅                       | Best (overall) | ✅                        |
 
 Explanation of the terms in the table:
 
@@ -87,6 +89,65 @@ Explanation of the terms in the table:
 
 The `duration_based_chunks` algorithm aims to find optimal boundaries for the list of tests and every test group contains all tests between the start and end boundary.
 The `least_duration` algorithm walks the list of tests and assigns each test to the group with the smallest current duration.
+
+The `optimal_chunks` algorithm splits the test list into the same kind of
+contiguous, non-overlapping groups as `duration_based_chunks` (so it maintains
+absolute order and never scatters tests across groups), but it computes the cut
+points that **minimise the duration of the slowest group** instead of using a
+greedy rule. Concretely, given test durations `[5, 4, 4]` split into two groups,
+`duration_based_chunks` produces `[5, 4] | [4]` (slowest group = 9), while
+`optimal_chunks` produces `[5] | [4, 4]` (slowest group = 8). This is the classic
+[linear partition / "split array largest sum"](https://leetcode.com/problems/split-array-largest-sum/)
+problem, solved optimally via binary search on the makespan.
+
+Prefer `optimal_chunks` over `least_duration` when your suite has implicit
+ordering between neighbouring tests — a common situation with **Django**, where
+`TestCase` / `TransactionTestCase` leak database state and auto-increment IDs
+between adjacent tests. `least_duration` reorders tests for the sake of a
+marginally better balance and tends to surface those latent dependencies as
+flaky failures; `optimal_chunks` keeps neighbours together while still giving you
+the best possible balance for that order.
+
+## Splitting granularity
+
+By default `pytest-split` splits at the level of individual test *items*: pytest
+collects (imports) the whole test tree, then the plugin deselects the items that
+don't belong to the current group. On a large suite that whole-tree import is the
+dominant per-shard cost — every shard imports everything just to run its slice.
+
+`--split-granularity=file` (default `item`) makes a shard import only the files
+its own tests live in, while keeping item-level balance. It needs no extra
+artifact — everything comes from the stored `.test_durations`:
+
+1. **Plan (offline).** The item-level optimal split is computed from the per-test
+   durations. From it each shard learns *which files its tests live in* (a
+   "footprint"). Almost every file belongs to one shard; only the handful of
+   *boundary* files at a shard's edge belong to two.
+2. **Prune (pre-import).** `pytest_ignore_collect` skips every file not in this
+   shard's footprint, **before it is imported** — so a shard imports ~1/N of the
+   tree instead of all of it. That's the collection saving.
+3. **Tile (post-import).** The few boundary files shared by two shards are split
+   by spending a precomputed weight *budget* in the file's real collection order,
+   so the cut is runtime-contiguous (as order-safe as `optimal_chunks`) and the
+   two shards tile the file exactly.
+
+```sh
+pytest --splits 3 --group 1 --split-granularity file
+```
+
+Notes:
+* Requires pytest >= 7 (it uses the `collection_path` ignore-collect hook).
+* The durations universe is scoped to what the run collects — its target paths,
+  minus `--ignore`, minus files no longer on disk — so a multi-segment CI doesn't
+  pollute one segment's partition with another's files or stale keys.
+* Files with no stored timing (new tests) are placed deterministically, so each
+  runs on exactly one shard — coverage is never dropped or duplicated.
+* The split is always the contiguous makespan-optimal one, so `--splitting-algorithm`
+  has no effect in file mode (it applies to `--split-granularity=item`).
+* Like the item-level algorithms, file mode assumes every shard collects in the
+  same order. With a test-shuffling plugin (`pytest-randomly` etc.) pin one global
+  seed across shards, or a boundary file can tile inconsistently. nbval notebook
+  regrouping (an item-mode feature) is not applied in file mode.
 
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)
