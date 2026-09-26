@@ -12,37 +12,43 @@ jobs:
   draft-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/python-poetry-env
       - name: Update version
         id: updated_version
         shell: bash
+        env:
+          VERSION: ${{ github.event.inputs.version }}
         run: |
-          poetry version ${{ github.event.inputs.version }}
+          poetry version "$VERSION"
           version=$(poetry version --short)
           echo ::set-output name="version::$version"
       - name: Update changelog
         id: changelog
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.updated_version.outputs.version }}
         run: |
-          poetry run kacl-cli release ${{ steps.updated_version.outputs.version }} --modify --auto-link
+          poetry run kacl-cli release "$RELEASE_VERSION" --modify --auto-link
           echo "" >> CHANGELOG.md
-          body=$(poetry run kacl-cli get ${{ steps.updated_version.outputs.version }})
+          body=$(poetry run kacl-cli get "$RELEASE_VERSION")
           body="${body//'%'/'%25'}"
           body="${body//$'\n'/'%0A'}"
           body="${body//$'\r'/'%0D'}"
           echo ::set-output name="body::$body"
       - name: Commit changes
-        uses: EndBug/add-and-commit@v7
+        uses: EndBug/add-and-commit@8c12ff729a98cfbcd3fe38b49f55eceb98a5ec02 # v7
         with:
           add: 'CHANGELOG.md pyproject.toml'
           message: 'Release ${{ steps.updated_version.outputs.version }}'
       - name: Create tag
+        env:
+          RELEASE_VERSION: ${{ steps.updated_version.outputs.version }}
         run: |
-          git tag ${{ steps.updated_version.outputs.version }}
-          git push origin ${{ steps.updated_version.outputs.version }}
+          git tag "$RELEASE_VERSION"
+          git push origin "$RELEASE_VERSION"
       - name: Create a draft release
-        uses: actions/create-release@v1
+        uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
