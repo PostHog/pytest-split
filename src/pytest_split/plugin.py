@@ -289,6 +289,14 @@ class PytestSplitFilePlugin(Base):
         # as the plan's thresholds, or the runtime split diverges from the plan.
         self.plan_durations = self._plan_durations(config)
         self.plan = algorithms.item_plan(self.plan_durations, self.splits)
+        # Explicit file arguments bypass pytest_ignore_collect. Prune them only
+        # after planning from the full selection so shared files keep the same cuts.
+        config.args = [
+            arg
+            for arg in config.args
+            if not (self.invocation_dir / arg.split("::", 1)[0]).is_file()
+            or self._collects_file(self._as_rel(arg))
+        ]
 
     def _plan_durations(self, config: "Config") -> "dict[str, float]":
         """Per-test durations used to build the split plan.
@@ -421,10 +429,6 @@ class PytestSplitFilePlugin(Base):
 
         for path, file_items in by_file.items():
             if path not in plan.file_offset:
-                # Untimed file: keep it only if we are its hash owner. ignore_collect
-                # already gates this for walked files, but files named explicitly on
-                # the command line bypass ignore_collect, so decide authoritatively
-                # here to stay exactly-once.
                 owner = algorithms.stable_group(path, plan.num_shards)
                 (kept if owner == self.group_idx else deselected).extend(file_items)
                 continue

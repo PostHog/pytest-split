@@ -484,17 +484,29 @@ class TestFileGranularity:
         assert _passed_test_names(group_1) == ["test_a1", "test_a2"]
         assert _passed_test_names(group_2) == ["test_z1", "test_z2"]
 
-    def test_skips_other_groups_files_before_import(self, testdir, durations_path):
+    @pytest.mark.parametrize(
+        "targets",
+        [(), ("test_aaa.py", "test_zzz.py")],
+        ids=["directory", "explicit-files"],
+    )
+    def test_skips_other_groups_files_before_import(
+        self, testdir, durations_path, targets
+    ):
+        rootdir = ("--rootdir", str(testdir.tmpdir))
         testdir.makepyfile(
             test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
             test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
         )
-        testdir.runpytest("--store-durations", "--durations-path", durations_path)
+        testdir.runpytest(
+            *rootdir, "--store-durations", "--durations-path", durations_path
+        )
         # make the second file blow up the moment it is imported (collected)
         testdir.makepyfile(test_zzz="raise RuntimeError('test_zzz was imported')\n")
 
         # group 1 owns test_aaa -> test_zzz is pruned before import, so no error
         owner_of_aaa = testdir.runpytest_subprocess(
+            *rootdir,
+            *targets,
             "--splits",
             "2",
             "--group",
@@ -510,6 +522,8 @@ class TestFileGranularity:
         # group 2 owns test_zzz -> it IS imported, so the raise surfaces. This is
         # the converse that proves the skip above is real, not unconditional.
         owner_of_zzz = testdir.runpytest_subprocess(
+            *rootdir,
+            *targets,
             "--splits",
             "2",
             "--group",
@@ -561,7 +575,14 @@ class TestFileGranularity:
         assert result.ret == ExitCode.USAGE_ERROR
         result.stderr.fnmatch_lines(["*requires pytest>=7*"])
 
-    def test_oversized_file_is_split_across_its_bucket(self, testdir, durations_path):
+    @pytest.mark.parametrize(
+        "targets",
+        [(), ("test_heavy.py", "test_light.py")],
+        ids=["directory", "explicit-files"],
+    )
+    def test_oversized_file_is_split_across_its_bucket(
+        self, testdir, durations_path, targets
+    ):
         # A file far heavier than one shard widens its bucket; stage 2 then splits
         # that file's items across the bucket's shards -- so both shards collect it
         # (the overlap) and each runs part of it. Neither shard is left empty.
@@ -578,6 +599,7 @@ class TestFileGranularity:
         runs = [
             testdir.inline_run(
                 *rootdir,
+                *targets,
                 "--splits",
                 "2",
                 "--group",
@@ -625,15 +647,15 @@ class TestFileGranularity:
         )
         assert sorted(_passed_test_names(result)) == ["test_r1", "test_r2"]
 
-    def test_explicit_selector_args_run_each_test_once(self, testdir, durations_path):
-        # `pytest file.py::test_x` selector args must still split exactly-once:
-        # the scope has to strip the `::selector`, and because explicit args
-        # bypass pytest_ignore_collect, untimed files must be hash-gated in
-        # modifyitems instead of kept by every shard.
+    @pytest.mark.parametrize("splits", [2, 6])
+    def test_explicit_selector_args_run_each_test_once(
+        self, testdir, durations_path, splits
+    ):
         rootdir = ("--rootdir", str(testdir.tmpdir))
         testdir.makepyfile(
             test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
             test_bbb="def test_b1(): pass\ndef test_b2(): pass\n",
+            test_unselected="raise AssertionError('unselected file was imported')\n",
         )
         with open(durations_path, "w") as f:
             json.dump({}, f)  # untimed -> hash-gated
@@ -644,12 +666,12 @@ class TestFileGranularity:
             "test_bbb.py::test_b2",
         ]
         ran = []
-        for group in (1, 2):
+        for group in range(1, splits + 1):
             result = testdir.inline_run(
                 *rootdir,
                 *selectors,
                 "--splits",
-                "2",
+                str(splits),
                 "--group",
                 str(group),
                 "--durations-path",
@@ -657,11 +679,25 @@ class TestFileGranularity:
                 "--split-granularity",
                 "file",
             )
+            assert result.ret in (ExitCode.OK, ExitCode.NO_TESTS_COLLECTED)
             ran.extend(_passed_test_names(result))
         assert sorted(ran) == ["test_a1", "test_a2", "test_b1", "test_b2"]
 
+    @pytest.mark.parametrize(
+        "targets",
+        [
+            ("tests",),
+            (
+                "tests/test_heavy.py",
+                "tests/test_light_a.py",
+                "tests/test_light_b.py",
+                "tests/test_light_c.py",
+            ),
+        ],
+        ids=["directory", "explicit-files"],
+    )
     def test_relative_targets_resolve_from_the_invocation_dir(
-        self, testdir, durations_path, monkeypatch
+        self, testdir, durations_path, monkeypatch, targets
     ):
         # A run started below rootdir (`cd pkg && pytest --rootdir .. tests`) names its
         # targets relative to where it started. Resolved against rootdir, they scoped
@@ -681,7 +717,7 @@ class TestFileGranularity:
         for group in ("1", "2"):
             result = testdir.inline_run(
                 *rootdir,
-                "tests",
+                *targets,
                 "--splits",
                 "2",
                 "--group",

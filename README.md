@@ -123,9 +123,9 @@ artifact — everything comes from the stored `.test_durations`:
    durations. From it each shard learns *which files its tests live in* (a
    "footprint"). Almost every file belongs to one shard; only the handful of
    *boundary* files at a shard's edge belong to two.
-2. **Prune (pre-import).** `pytest_ignore_collect` skips every file not in this
-   shard's footprint, **before it is imported** — so a shard imports ~1/N of the
-   tree instead of all of it. That's the collection saving.
+2. **Prune (pre-import).** The plugin removes explicit file arguments outside
+   this shard's footprint and uses `pytest_ignore_collect` when walking directories.
+   Both paths skip other shards' files before import.
 3. **Tile (post-import).** The few boundary files shared by two shards are split
    by spending a precomputed weight *budget* in the file's real collection order,
    so the cut is runtime-contiguous (as order-safe as `optimal_chunks`) and the

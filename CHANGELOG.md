@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   otherwise all be guessed at the suite-wide mean and skew a single shard.
 
 ### Fixed
+- Skip other shards' files before import when file-mode runs name test files or
+  node IDs explicitly, including shards with no matching files.
 - Fix malformed bullet points rendering in GitHub Pages documentation
 
 ## [0.11.0] - 2026-02-03
