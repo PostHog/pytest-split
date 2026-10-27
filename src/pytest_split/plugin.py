@@ -291,12 +291,17 @@ class PytestSplitFilePlugin(Base):
         self.plan = algorithms.item_plan(self.plan_durations, self.splits)
         # Explicit file arguments bypass pytest_ignore_collect. Prune them only
         # after planning from the full selection so shared files keep the same cuts.
-        config.args = [
-            arg
-            for arg in config.args
-            if not (self.invocation_dir / arg.split("::", 1)[0]).is_file()
-            or self._collects_file(self._as_rel(arg))
-        ]
+        shard_args: list[str] = []
+        for arg in config.args:
+            # pytest normalizes paths without resolving file symlinks.
+            path = Path(os.path.abspath(self.invocation_dir / arg.split("::", 1)[0]))
+            if (
+                not path.is_file()
+                or not path.is_relative_to(self.rootpath)
+                or self._collects_file(path.relative_to(self.rootpath).as_posix())
+            ):
+                shard_args.append(arg)
+        config.args = shard_args
 
     def _plan_durations(self, config: "Config") -> "dict[str, float]":
         """Per-test durations used to build the split plan.

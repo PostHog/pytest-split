@@ -648,8 +648,11 @@ class TestFileGranularity:
         assert sorted(_passed_test_names(result)) == ["test_r1", "test_r2"]
 
     @pytest.mark.parametrize("splits", [2, 6])
+    @pytest.mark.parametrize(
+        "path_kind", ["relative", "absolute", "symlink", "outside-root"]
+    )
     def test_explicit_selector_args_run_each_test_once(
-        self, testdir, durations_path, splits
+        self, testdir, durations_path, splits, path_kind
     ):
         rootdir = ("--rootdir", str(testdir.tmpdir))
         testdir.makepyfile(
@@ -665,6 +668,18 @@ class TestFileGranularity:
             "test_bbb.py::test_b1",
             "test_bbb.py::test_b2",
         ]
+        if path_kind == "symlink":
+            for name in ("aaa", "bbb"):
+                testdir.tmpdir.join(f"test_link_{name}.py").mksymlinkto(
+                    testdir.tmpdir.join(f"test_{name}.py")
+                )
+            selectors = [
+                selector.replace("test_", "test_link_", 1) for selector in selectors
+            ]
+        elif path_kind in ("absolute", "outside-root"):
+            selectors = [str(testdir.tmpdir.join(selector)) for selector in selectors]
+            if path_kind == "outside-root":
+                rootdir = ("--rootdir", str(testdir.tmpdir.mkdir("root")))
         ran = []
         for group in range(1, splits + 1):
             result = testdir.inline_run(
