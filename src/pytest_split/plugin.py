@@ -29,6 +29,9 @@ MIN_PYTEST_FOR_FILE_GRANULARITY = 7
 # older pinned pytest-split) can feature-detect `--split-plan-path` with a plain
 # import instead of inspecting argparse, and only pass the flag when it exists.
 SUPPORTS_SPLIT_PLAN_PATH = True
+# Older versions plan from the whole `--split-plan-path` file, so a run that targets
+# a subset of it gets unbalanced shards.
+SCOPES_SPLIT_PLAN_PATH = True
 
 
 def pytest_addoption(parser: "Parser") -> None:
