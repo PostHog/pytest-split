@@ -830,6 +830,46 @@ class TestFileGranularity:
                 "test_zzz.py::test_z2",
             }
 
+    def test_split_plan_path_is_scoped_to_targets(self, testdir, durations_path):
+        # A selected run targets a subset of the plan file. An untargeted file in the
+        # plan would shift the cut into test_aaa and split it across both groups.
+        rootdir = ("--rootdir", str(testdir.tmpdir))
+        testdir.makepyfile(
+            test_000="def test_untargeted(): pass\n",
+            test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
+            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+        )
+        plan_path = str(testdir.tmpdir.join(".plan.json"))
+        with open(plan_path, "w") as f:
+            json.dump(
+                {
+                    "test_000.py::test_untargeted": 2.0,
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
+        common = (
+            *rootdir,
+            "test_aaa.py",
+            "test_zzz.py",
+            "--splits",
+            "2",
+            "--durations-path",
+            durations_path,
+            "--split-plan-path",
+            plan_path,
+            "--split-granularity",
+            "file",
+        )
+        group_1 = testdir.inline_run(*common, "--group", "1")
+        group_2 = testdir.inline_run(*common, "--group", "2")
+
+        assert _passed_test_names(group_1) == ["test_a1", "test_a2"]
+        assert _passed_test_names(group_2) == ["test_z1", "test_z2"]
+
     def test_split_plan_path_missing_falls_back_to_durations(
         self, testdir, durations_path
     ):

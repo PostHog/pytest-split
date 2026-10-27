@@ -95,10 +95,10 @@ def pytest_addoption(parser: "Parser") -> None:
         help=(
             "For '--split-granularity=file': read the per-test durations used to build "
             "the split *plan* from this file instead of '--durations-path'. Use it to "
-            "point a shard at a plan scoped to exactly what this run collects -- e.g. a "
-            "per-segment durations file -- when '--durations-path' is a union across "
-            "several CI jobs (whose extra tests would mis-budget the plan). Only affects "
-            "planning; '--store-durations' still writes to '--durations-path'."
+            "point a shard at a per-segment durations file when '--durations-path' is a "
+            "union across several CI jobs (whose extra tests would mis-budget the plan). "
+            "The plan is still scoped to this run's targets and '--ignore's. Only "
+            "affects planning; '--store-durations' still writes to '--durations-path'."
         ),
     )
     group.addoption(
@@ -306,35 +306,24 @@ class PytestSplitFilePlugin(Base):
     def _plan_durations(self, config: "Config") -> "dict[str, float]":
         """Per-test durations used to build the split plan.
 
-        Default: scope ``--durations-path`` to what this run collects (see
-        :meth:`_scoped_durations`). With ``--split-plan-path`` set, read the plan from
-        that file instead -- a plan already scoped to this run (e.g. a per-segment
-        durations file), so it needs no target/ignore scoping; only stale keys whose
-        file has since been deleted are dropped. An unusable plan file -- missing
-        (cache miss before the first per-segment build), empty, or corrupt/truncated (a
-        partial cache restore) -- falls back to the scoped durations so the shard still
-        runs balanced instead of crashing or planning from nothing.
+        Read from ``--split-plan-path`` when set (e.g. a per-segment durations file
+        free of other segments' tests), else from ``--durations-path``, then scope to
+        what this run collects (see :meth:`_scoped_durations`), so a run that targets a
+        subset of the plan file's tests still plans from that subset only. An unusable
+        plan file -- missing (cache miss before the first per-segment build), empty, or
+        corrupt/truncated (a partial cache restore) -- falls back to
+        ``--durations-path`` so the shard still runs balanced instead of crashing or
+        planning from nothing.
         """
+        durations = self.cached_durations
         plan_path = config.getoption("split_plan_path")
-        if not plan_path:
-            return self._scoped_durations(config)
-        try:
-            with open(plan_path) as f:
-                durations = json.loads(f.read())
-        except (FileNotFoundError, ValueError):  # ValueError covers JSONDecodeError
-            return self._scoped_durations(config)
-        if not durations:
-            return self._scoped_durations(config)
-        on_disk: dict[str, bool] = {}
-        scoped: dict[str, float] = {}
-        for nodeid, dur in durations.items():
-            path = algorithms._path_of(nodeid)  # noqa: SLF001  (same-package helper)
-            keep = on_disk.get(path)
-            if keep is None:
-                keep = on_disk[path] = (self.rootpath / path).exists()
-            if keep:
-                scoped[nodeid] = dur
-        return scoped
+        if plan_path:
+            try:
+                with open(plan_path) as f:
+                    durations = json.loads(f.read()) or durations
+            except (FileNotFoundError, ValueError):  # ValueError covers JSONDecodeError
+                pass
+        return self._scoped_durations(config, durations)
 
     def _as_rel(self, target: str) -> str:
         """A pytest target (path arg or --ignore) as a rootdir-relative posix str."""
@@ -347,7 +336,9 @@ class PytestSplitFilePlugin(Base):
         except ValueError:
             return Path(target).as_posix().rstrip("/")
 
-    def _scoped_durations(self, config: "Config") -> "dict[str, float]":
+    def _scoped_durations(
+        self, config: "Config", durations: "dict[str, float]"
+    ) -> "dict[str, float]":
         """Durations restricted to files this run collects: under a target path,
         not ``--ignore``-d, and still present on disk (drops stale keys)."""
         targets = [self._as_rel(a) for a in (config.args or [])]
@@ -367,7 +358,7 @@ class PytestSplitFilePlugin(Base):
             )
 
         scoped: dict[str, float] = {}
-        for nodeid, dur in self.cached_durations.items():
+        for nodeid, dur in durations.items():
             path = algorithms._path_of(nodeid)  # noqa: SLF001  (same-package helper)
             keep = keep_file.get(path)
             if keep is None:
