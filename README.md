@@ -140,6 +140,10 @@ Notes:
 * The durations universe is scoped to what the run collects — its target paths,
   minus `--ignore`, minus files no longer on disk — so a multi-segment CI doesn't
   pollute one segment's partition with another's files or stale keys.
+* `--split-plan-path <file>` builds the plan from a separate durations file, such
+  as one segment's timings, with the same scoping. `--store-durations` still
+  writes to `--durations-path`. A missing or unreadable plan file falls back to
+  `--durations-path`.
 * Files with no stored timing (new tests) are placed deterministically, so each
   runs on exactly one shard — coverage is never dropped or duplicated.
 * The split is always the contiguous makespan-optimal one, so `--splitting-algorithm`

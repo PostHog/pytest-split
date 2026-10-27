@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   to the run's targets (minus `--ignore`, minus files no longer on disk), so a
   multi-segment CI doesn't cross-pollute or carry stale keys. Untimed files are
   placed deterministically. Requires pytest >= 7.
+- New `--split-plan-path` option for file mode. It builds the plan from a separate
+  durations file (e.g. one CI segment's timings) while `--store-durations` keeps
+  writing to `--durations-path`. The plan file is scoped to the run's targets like
+  `--durations-path`. `SUPPORTS_SPLIT_PLAN_PATH` and `SCOPES_SPLIT_PLAN_PATH` in
+  `pytest_split.plugin` let callers detect both behaviors with an import.
 - New `optimal_chunks` splitting algorithm. Like `duration_based_chunks` it keeps
   tests in contiguous, in-order groups (so it never scatters tests the way
   `least_duration` does), but it computes the cut points that minimise the
