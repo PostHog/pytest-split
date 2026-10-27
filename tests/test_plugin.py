@@ -913,7 +913,9 @@ class TestFileGranularity:
         assert _passed_test_names(result) == ["test_a1", "test_a2"]
 
     @pytest.mark.parametrize(
-        "bad", ["", "{", "{}", "   "], ids=["empty", "truncated", "no-tests", "blank"]
+        "bad",
+        ["", "{", "{}", "   ", "[1, 2]"],
+        ids=["empty", "truncated", "no-tests", "blank", "not-durations"],
     )
     def test_split_plan_path_unusable_falls_back_to_durations(
         self, testdir, durations_path, bad

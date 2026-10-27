@@ -323,8 +323,12 @@ class PytestSplitFilePlugin(Base):
         if plan_path:
             try:
                 with open(plan_path) as f:
-                    durations = json.loads(f.read()) or durations
-            except (FileNotFoundError, ValueError):  # ValueError covers JSONDecodeError
+                    plan = json.load(f)
+                if isinstance(plan, list):  # legacy [[nodeid, duration], ...] format
+                    plan = dict(plan)
+                if isinstance(plan, dict) and plan:
+                    durations = plan
+            except (OSError, TypeError, ValueError):
                 pass
         return self._scoped_durations(config, durations)
 
