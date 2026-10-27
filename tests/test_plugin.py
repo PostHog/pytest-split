@@ -495,13 +495,19 @@ class TestFileGranularity:
         rootdir = ("--rootdir", str(testdir.tmpdir))
         testdir.makepyfile(
             test_aaa="def test_a1(): pass\ndef test_a2(): pass\n",
-            test_zzz="def test_z1(): pass\ndef test_z2(): pass\n",
+            # blows up the moment it is imported (collected)
+            test_zzz="raise RuntimeError('test_zzz was imported')\n",
         )
-        testdir.runpytest(
-            *rootdir, "--store-durations", "--durations-path", durations_path
-        )
-        # make the second file blow up the moment it is imported (collected)
-        testdir.makepyfile(test_zzz="raise RuntimeError('test_zzz was imported')\n")
+        with open(durations_path, "w") as f:
+            json.dump(
+                {
+                    "test_aaa.py::test_a1": 1.0,
+                    "test_aaa.py::test_a2": 1.0,
+                    "test_zzz.py::test_z1": 1.0,
+                    "test_zzz.py::test_z2": 1.0,
+                },
+                f,
+            )
 
         # group 1 owns test_aaa -> test_zzz is pruned before import, so no error
         owner_of_aaa = testdir.runpytest_subprocess(
